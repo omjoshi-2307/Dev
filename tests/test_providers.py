@@ -68,9 +68,9 @@ def test_openai_provider_requires_api_key() -> None:
 def test_ollama_provider_sends_non_streaming_chat_request() -> None:
     captured: dict[str, object] = {}
 
-    async def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx.Request) -> httpx.Response:
         captured["url"] = str(request.url)
-        captured["payload"] = await request.aread()
+        captured["payload"] = request.content
         return httpx.Response(
             200,
             json={"message": {"role": "assistant", "content": "Hello locally"}},
