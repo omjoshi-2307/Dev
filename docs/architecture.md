@@ -26,8 +26,8 @@
 |---|---|---|
 | Gateway | API entry point, request validation, client authentication | Initial API skeleton |
 | AI router | Provider selection, policy, fallback | Planned |
-| OpenAI adapter | Cloud model requests | Planned |
-| Ollama adapter | Local model requests | Planned |
+| OpenAI adapter | Cloud model requests | Implemented on `feature/provider-adapters` |
+| Ollama adapter | Local model requests | Implemented on `feature/provider-adapters` |
 | Orchestrator | Conversation flow and tool-call lifecycle | Planned |
 | Memory hub | User-controlled memory and retrieval | Planned |
 | Context bridge | Approved context export/import | Planned |
@@ -71,8 +71,8 @@ DEV is the canonical owner of its memory. ChatGPT does not automatically share i
 
 1. Python backend skeleton and settings.
 2. Health endpoint and automated tests.
-3. OpenAI and Ollama provider adapters behind a common interface.
-4. Policy-based model routing and safe fallback.
-5. Validated chat API and provider tests.
+3. OpenAI and Ollama provider adapters behind a common interface — implemented on `feature/provider-adapters`; local execution remains to be verified.
+4. Policy-based model routing and safe fallback — next.
+5. Validated chat API and provider tests — adapter unit tests added; local test execution remains pending.
 
 Voice, desktop control, long-term memory, context synchronization, mobile access and autonomous multi-agent workflows are intentionally out of scope for Stage 1.
