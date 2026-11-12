@@ -42,7 +42,6 @@ class OpenAIProvider:
         if not messages:
             raise ValueError("At least one chat message is required.")
 
-        client = self._client or AsyncOpenAI(api_key=api_key)
         input_messages = [
             {
                 "role": "developer" if message.role == "system" else message.role,
@@ -50,10 +49,19 @@ class OpenAIProvider:
             }
             for message in messages
         ]
-        response = await client.responses.create(
-            model=model,
-            input=input_messages,
-        )
+
+        if self._client is not None:
+            response = await self._client.responses.create(
+                model=model,
+                input=input_messages,
+            )
+        else:
+            async with AsyncOpenAI(api_key=api_key) as client:
+                response = await client.responses.create(
+                    model=model,
+                    input=input_messages,
+                )
+
         return ProviderResponse(
             content=response.output_text,
             provider=self.name,
