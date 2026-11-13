@@ -59,7 +59,9 @@ def test_openai_provider_maps_system_role_to_developer() -> None:
 
 
 def test_openai_provider_requires_api_key() -> None:
-    provider = OpenAIProvider(settings=Settings(OPENAI_MODEL="test-model"))
+    provider = OpenAIProvider(
+        settings=Settings(OPENAI_MODEL="test-model", OPENAI_API_KEY=None)
+    )
 
     with pytest.raises(ProviderConfigurationError, match="OPENAI_API_KEY"):
         asyncio.run(provider.generate([ChatMessage(role="user", content="Hi")]))
