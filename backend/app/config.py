@@ -37,6 +37,19 @@ class Settings(BaseSettings):
         validation_alias="OLLAMA_MODEL",
     )
 
+    router_default_privacy_level: str = Field(
+        default="local_only",
+        validation_alias="DEV_ROUTER_DEFAULT_PRIVACY_LEVEL",
+    )
+    router_default_provider: str = Field(
+        default="auto",
+        validation_alias="DEV_ROUTER_DEFAULT_PROVIDER",
+    )
+    router_allow_fallback: bool = Field(
+        default=False,
+        validation_alias="DEV_ROUTER_ALLOW_FALLBACK",
+    )
+
     model_config = SettingsConfigDict(
         env_file=REPOSITORY_ROOT / ".env",
         env_file_encoding="utf-8",
