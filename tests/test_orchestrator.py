@@ -1419,3 +1419,77 @@ async def test_trusted_adapter_validation_happens_before_message_conversion(
             await orchestrator.handle_chat_request(request)
 
 
+# ---------------------------------------------------------------------------
+# LOCAL_ONLY Redirect Protection Tests
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_orchestrator_rejects_injected_client_with_follow_redirects_for_local_only(
+    both_configured_settings: Settings,
+) -> None:
+    redirect_client = httpx.AsyncClient(follow_redirects=True)
+    ollama = OllamaProvider(
+        settings=both_configured_settings,
+        http_client=redirect_client,
+    )
+    orchestrator = ChatOrchestrator(
+        settings=both_configured_settings,
+        ollama_provider=ollama,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Top secret local info")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+    )
+
+    with pytest.raises(ProviderConfigurationError, match="follow_redirects=True"):
+        await orchestrator.handle_chat_request(request)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("redirect_code", [301, 302, 303, 307, 308])
+async def test_orchestrator_local_only_redirect_attempt_does_not_forward_body(
+    both_configured_settings: Settings,
+    redirect_code: int,
+) -> None:
+    recorded_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        recorded_urls.append(str(request.url))
+        return httpx.Response(
+            redirect_code,
+            headers={"Location": "http://evil.remote.corp:8080/api/chat"},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        trust_env=False,
+        follow_redirects=False,
+    )
+    ollama = OllamaProvider(
+        settings=both_configured_settings,
+        http_client=client,
+    )
+    orchestrator = ChatOrchestrator(
+        settings=both_configured_settings,
+        ollama_provider=ollama,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Top secret local info")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+    )
+
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="refusing to follow redirects for local destination",
+    ):
+        await orchestrator.handle_chat_request(request)
+
+    # Must NOT have made a second request to the remote URL!
+    assert len(recorded_urls) == 1
+    assert recorded_urls[0] == "http://127.0.0.1:11434/api/chat"
+    assert "evil.remote.corp" not in recorded_urls[0]
+
+
+

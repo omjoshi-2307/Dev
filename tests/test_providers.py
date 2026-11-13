@@ -928,7 +928,10 @@ async def test_ollama_provider_loopback_disables_trust_env_by_default(
         async def __aexit__(self, *args: object) -> None:
             pass
 
-        async def post(self, url: str, json: dict[str, object]) -> httpx.Response:
+        async def post(
+            self, url: str, json: dict[str, object], **kwargs: object
+        ) -> httpx.Response:
+            recorded_kwargs.update(kwargs)
             return httpx.Response(
                 200,
                 json={"message": {"role": "assistant", "content": "direct reply"}},
@@ -965,7 +968,10 @@ async def test_ollama_provider_remote_enables_trust_env_by_default(
         async def __aexit__(self, *args: object) -> None:
             pass
 
-        async def post(self, url: str, json: dict[str, object]) -> httpx.Response:
+        async def post(
+            self, url: str, json: dict[str, object], **kwargs: object
+        ) -> httpx.Response:
+            recorded_kwargs.update(kwargs)
             return httpx.Response(
                 200,
                 json={"message": {"role": "assistant", "content": "remote reply"}},
@@ -1091,7 +1097,10 @@ async def test_ollama_provider_explicit_trust_env_true_on_loopback_still_disable
         async def __aexit__(self, *args: object) -> None:
             pass
 
-        async def post(self, url: str, json: dict[str, object]) -> httpx.Response:
+        async def post(
+            self, url: str, json: dict[str, object], **kwargs: object
+        ) -> httpx.Response:
+            recorded_kwargs.update(kwargs)
             return httpx.Response(
                 200,
                 json={"message": {"role": "assistant", "content": "direct reply"}},
@@ -1191,5 +1200,73 @@ def test_validate_injected_client_non_httpx_client_rejected() -> None:
         match="not a valid or verifiable HTTPX client",
     ):
         validate_injected_client_for_local_endpoint(DummyClient())
+
+
+def test_validate_injected_client_follow_redirects_true_rejected() -> None:
+    client = httpx.AsyncClient(follow_redirects=True)
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="follow_redirects=True",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
+
+@pytest.mark.anyio
+async def test_ollama_provider_injected_client_with_follow_redirects_rejected() -> None:
+    client = httpx.AsyncClient(follow_redirects=True)
+    provider = OllamaProvider(
+        settings=Settings(
+            OLLAMA_BASE_URL="http://127.0.0.1:11434",
+            OLLAMA_MODEL="small-model",
+        ),
+        http_client=client,
+    )
+
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="follow_redirects=True",
+    ):
+        await provider.generate([ChatMessage(role="user", content="hello")])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("redirect_code", [301, 302, 303, 307, 308])
+async def test_ollama_provider_simulated_redirect_fails_closed_without_forwarding(
+    redirect_code: int,
+) -> None:
+    recorded_requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        recorded_requests.append(str(request.url))
+        return httpx.Response(
+            redirect_code,
+            headers={"Location": "http://evil.remote.corp:8080/api/chat"},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        trust_env=False,
+        follow_redirects=False,
+    )
+    provider = OllamaProvider(
+        settings=Settings(
+            OLLAMA_BASE_URL="http://127.0.0.1:11434",
+            OLLAMA_MODEL="small-model",
+        ),
+        http_client=client,
+    )
+
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="refusing to follow redirects for local destination",
+    ):
+        await provider.generate([ChatMessage(role="user", content="secret payload")])
+
+    # Exactly one request made to local loopback; redirect target was NEVER reached
+    assert len(recorded_requests) == 1
+    assert recorded_requests[0] == "http://127.0.0.1:11434/api/chat"
+    assert "evil.remote.corp" not in recorded_requests[0]
+
 
 

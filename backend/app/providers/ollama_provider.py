@@ -91,14 +91,21 @@ def validate_injected_client_for_local_endpoint(client: Any) -> None:
             "environment variables are active, risking proxy leakage."
         )
 
-    # 2. Proxy mounts check
+    # 2. Redirect configuration check
+    if getattr(client, "follow_redirects", False):
+        raise ProviderConfigurationError(
+            "Injected HTTP client for local Ollama provider has follow_redirects=True, "
+            "risking redirect-based message exfiltration."
+        )
+
+    # 3. Proxy mounts check
     if hasattr(client, "_mounts") and bool(client._mounts):
         raise ProviderConfigurationError(
             "Injected HTTP client for local Ollama provider has proxy mounts configured, "
             "violating local destination boundaries."
         )
 
-    # 3. Transport inspection
+    # 4. Transport inspection
     transport = getattr(client, "_transport", None)
     if transport is None:
         raise ProviderConfigurationError(
@@ -212,18 +219,31 @@ class OllamaProvider:
             response = await self._http_client.post(
                 f"{base_url}/api/chat",
                 json=payload,
+                follow_redirects=False,
             )
+            if is_local and 300 <= response.status_code < 400:
+                raise ProviderConfigurationError(
+                    f"Local Ollama endpoint responded with unexpected redirect status {response.status_code}, "
+                    "refusing to follow redirects for local destination."
+                )
             response.raise_for_status()
             data = response.json()
         else:
             async with httpx.AsyncClient(
                 timeout=120.0,
                 trust_env=effective_trust_env,
+                follow_redirects=False,
             ) as client:
                 response = await client.post(
                     f"{base_url}/api/chat",
                     json=payload,
+                    follow_redirects=False,
                 )
+                if is_local and 300 <= response.status_code < 400:
+                    raise ProviderConfigurationError(
+                        f"Local Ollama endpoint responded with unexpected redirect status {response.status_code}, "
+                        "refusing to follow redirects for local destination."
+                    )
                 response.raise_for_status()
                 data = response.json()
 
