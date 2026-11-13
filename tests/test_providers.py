@@ -205,7 +205,7 @@ def test_openai_provider_handles_429_rate_limit_error() -> None:
 
     with pytest.raises(
         RuntimeError,
-        match="OpenAI rate limit or quota exceeded: You exceeded your current quota",
+        match="OpenAI rate limit or quota exceeded: Quota or billing limit reached.",
     ):
         asyncio.run(run())
 
@@ -488,7 +488,8 @@ def test_openai_provider_backwards_compatibility_legacy_client() -> None:
         OPENAI_API_KEY="test-key",
         OPENAI_MODEL="test-model",
     )
-    provider = OpenAIProvider(settings=settings, client=client)
+    # The second positional argument remains the legacy SDK client slot.
+    provider = OpenAIProvider(settings, client)
 
     result = asyncio.run(
         provider.generate([ChatMessage(role="user", content="Hello")])
@@ -506,72 +507,6 @@ def test_openai_provider_backwards_compatibility_legacy_client() -> None:
 # ---------------------------------------------------------------------------
 # PR #4 Security Review Regression Tests
 # ---------------------------------------------------------------------------
-
-
-def test_untrusted_http_endpoint_cannot_receive_credentials() -> None:
-    captured_request = False
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal captured_request
-        captured_request = True
-        return httpx.Response(200, json={"output": []})
-
-    async def run() -> None:
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as client:
-            settings = Settings(
-                OPENAI_API_KEY="sensitive-secret-key-12345",
-                OPENAI_MODEL="gpt-4o-mini",
-            )
-            provider = OpenAIProvider(
-                settings=settings,
-                http_client=client,
-                endpoint="http://api.openai.com/v1/responses",
-            )
-            await provider.generate([ChatMessage(role="user", content="Hi")])
-
-    with pytest.raises(
-        ProviderConfigurationError,
-        match="Insecure endpoint scheme 'http'. OpenAI endpoints must use HTTPS.",
-    ):
-        asyncio.run(run())
-
-    # The untrusted HTTP endpoint was never reached and received no credentials
-    assert captured_request is False
-
-
-def test_untrusted_external_https_endpoint_cannot_receive_credentials() -> None:
-    captured_request = False
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal captured_request
-        captured_request = True
-        return httpx.Response(200, json={"output": []})
-
-    async def run() -> None:
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as client:
-            settings = Settings(
-                OPENAI_API_KEY="sensitive-secret-key-12345",
-                OPENAI_MODEL="gpt-4o-mini",
-            )
-            provider = OpenAIProvider(
-                settings=settings,
-                http_client=client,
-                endpoint="https://malicious-external-proxy.example.com/v1/responses",
-            )
-            await provider.generate([ChatMessage(role="user", content="Hi")])
-
-    with pytest.raises(
-        ProviderConfigurationError,
-        match="Untrusted endpoint host 'malicious-external-proxy.example.com'",
-    ):
-        asyncio.run(run())
-
-    # The untrusted external host was never reached and received no credentials
-    assert captured_request is False
 
 
 def test_mocked_429_response_does_not_expose_api_key() -> None:
@@ -605,8 +540,8 @@ def test_mocked_429_response_does_not_expose_api_key() -> None:
     error_msg = str(exc_info.value)
     # The API key must never appear in the error message
     assert test_key not in error_msg
-    assert "[REDACTED]" in error_msg
-    assert "OpenAI rate limit or quota exceeded" in error_msg
+    assert "OpenAI rate limit or quota exceeded: Quota or billing limit reached." in error_msg
+    assert "Rate limit exceeded for key" not in error_msg
 
 
 def test_mocked_500_response_does_not_expose_sensitive_content() -> None:
@@ -651,8 +586,16 @@ def test_validate_openai_endpoint_standalone() -> None:
     with pytest.raises(ProviderConfigurationError, match="HTTPS"):
         validate_openai_endpoint("http://api.openai.com/v1/responses")
 
-    with pytest.raises(ProviderConfigurationError, match="Untrusted endpoint host"):
-        validate_openai_endpoint("https://untrusted-host.com/v1/responses")
+    invalid_endpoints = [
+        "https://untrusted-host.com/v1/responses",
+        "https://api.openai.com:8443/v1/responses",
+        "https://api.openai.com/other-path",
+        "https://api.openai.com/v1/responses?redirect=https://evil.example",
+        "https://user:pass@api.openai.com/v1/responses",
+    ]
+    for endpoint in invalid_endpoints:
+        with pytest.raises(ProviderConfigurationError, match="canonical endpoint"):
+            validate_openai_endpoint(endpoint)
 
     with pytest.raises(ProviderConfigurationError, match="non-empty string"):
         validate_openai_endpoint("")
@@ -660,6 +603,161 @@ def test_validate_openai_endpoint_standalone() -> None:
     # Valid default endpoint succeeds without raising
     validate_openai_endpoint(DEFAULT_OPENAI_ENDPOINT)
 
+
+def test_openai_provider_does_not_allow_endpoint_override() -> None:
+    with pytest.raises(TypeError, match="endpoint"):
+        OpenAIProvider(
+            settings=Settings(OPENAI_API_KEY="test-key", OPENAI_MODEL="test"),
+            endpoint="https://api.openai.com:8443/v1/responses",
+        )
+
+
+
+def test_openai_provider_retries_transient_429_and_honors_retry_after() -> None:
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "0"},
+                json={"error": {"code": "rate_limit_exceeded"}},
+            )
+        return httpx.Response(
+            200,
+            json={"output_text": "Recovered after rate limit"},
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            provider = OpenAIProvider(
+                settings=Settings(OPENAI_API_KEY="test-key", OPENAI_MODEL="test"),
+                http_client=client,
+                retry_backoff=0,
+            )
+            result = await provider.generate(
+                [ChatMessage(role="user", content="Hi")]
+            )
+            assert result.content == "Recovered after rate limit"
+
+    asyncio.run(run())
+    assert attempts == 2
+
+
+def test_openai_provider_retries_transient_server_error() -> None:
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            return httpx.Response(503, text="private upstream diagnostic")
+        return httpx.Response(200, json={"output_text": "Recovered"})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            provider = OpenAIProvider(
+                settings=Settings(OPENAI_API_KEY="test-key", OPENAI_MODEL="test"),
+                http_client=client,
+                retry_backoff=0,
+            )
+            result = await provider.generate(
+                [ChatMessage(role="user", content="Hi")]
+            )
+            assert result.content == "Recovered"
+
+    asyncio.run(run())
+    assert attempts == 3
+
+
+def test_openai_provider_does_not_retry_permanent_quota_failure() -> None:
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            429,
+            json={"error": {"code": "insufficient_quota"}},
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            provider = OpenAIProvider(
+                settings=Settings(OPENAI_API_KEY="test-key", OPENAI_MODEL="test"),
+                http_client=client,
+                retry_backoff=0,
+            )
+            with pytest.raises(RuntimeError, match="Quota or billing limit reached"):
+                await provider.generate(
+                    [ChatMessage(role="user", content="Hi")]
+                )
+
+    asyncio.run(run())
+    assert attempts == 1
+
+
+def test_openai_provider_retries_transient_connection_failure() -> None:
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ConnectError("temporary network issue")
+        return httpx.Response(200, json={"output_text": "Connected"})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            provider = OpenAIProvider(
+                settings=Settings(OPENAI_API_KEY="test-key", OPENAI_MODEL="test"),
+                http_client=client,
+                retry_backoff=0,
+            )
+            result = await provider.generate(
+                [ChatMessage(role="user", content="Hi")]
+            )
+            assert result.content == "Connected"
+
+    asyncio.run(run())
+    assert attempts == 2
+
+
+def test_openai_provider_does_not_reflect_untrusted_4xx_message() -> None:
+    secret_diagnostic = "postgresql://admin:private-password@internal-db"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"error": {"message": f"Bad request: {secret_diagnostic}"}},
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            provider = OpenAIProvider(
+                settings=Settings(OPENAI_API_KEY="test-key", OPENAI_MODEL="test"),
+                http_client=client,
+                retry_backoff=0,
+            )
+            await provider.generate([ChatMessage(role="user", content="Hi")])
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(run())
+    assert "HTTP 400" in str(exc_info.value)
+    assert secret_diagnostic not in str(exc_info.value)
+    assert "private-password" not in str(exc_info.value)
 
 def test_sanitize_error_text_scrubs_secrets_and_bearer_tokens() -> None:
     raw_error = (
