@@ -912,3 +912,109 @@ async def test_orchestrator_local_only_proxy_environment_isolation(
         response = await orchestrator.handle_chat_request(request)
         assert response.content == "Local secure reply"
         assert response.provider == ProviderName.OLLAMA
+
+
+# ---------------------------------------------------------------------------
+# Provider Identity Enforcement & Proxy Transport Hardening Tests
+# ---------------------------------------------------------------------------
+def test_validate_provider_identity_helper(both_configured_settings: Settings) -> None:
+    from backend.app.orchestrator.service import validate_provider_identity
+    from backend.app.providers.ollama_provider import OllamaProvider
+    from backend.app.providers.openai_provider import OpenAIProvider
+
+    real_openai = OpenAIProvider(settings=both_configured_settings)
+    real_ollama = OllamaProvider(settings=both_configured_settings)
+
+    # Valid identities pass
+    validate_provider_identity(ProviderName.OLLAMA, real_ollama)
+    validate_provider_identity(ProviderName.OPENAI, real_openai)
+    validate_provider_identity(ProviderName.OLLAMA, MockProvider(name="ollama"))
+    validate_provider_identity(ProviderName.OPENAI, MockProvider(name="openai"))
+
+    # Mismatches raise RoutingPolicyError
+    with pytest.raises(RoutingPolicyError, match="Provider identity mismatch: OpenAIProvider cannot be"):
+        validate_provider_identity(ProviderName.OLLAMA, real_openai)
+
+    with pytest.raises(RoutingPolicyError, match="Provider identity mismatch: OllamaProvider cannot be"):
+        validate_provider_identity(ProviderName.OPENAI, real_ollama)
+
+    with pytest.raises(RoutingPolicyError, match="Provider identity mismatch: provider with name 'anthropic'"):
+        validate_provider_identity(ProviderName.OLLAMA, MockProvider(name="anthropic"))
+
+    with pytest.raises(RoutingPolicyError, match="Provider identity mismatch: provider with name 'anthropic'"):
+        validate_provider_identity(ProviderName.OPENAI, MockProvider(name="anthropic"))
+
+
+def test_orchestrator_rejects_mismatched_provider_injection_at_init(
+    both_configured_settings: Settings,
+) -> None:
+    from backend.app.providers.ollama_provider import OllamaProvider
+    from backend.app.providers.openai_provider import OpenAIProvider
+
+    real_openai = OpenAIProvider(settings=both_configured_settings)
+    real_ollama = OllamaProvider(settings=both_configured_settings)
+
+    # Injecting OpenAI as ollama_provider rejected
+    with pytest.raises(RoutingPolicyError, match="Provider identity mismatch: OpenAIProvider cannot be"):
+        ChatOrchestrator(
+            settings=both_configured_settings,
+            ollama_provider=real_openai,
+        )
+
+    # Injecting Ollama as openai_provider rejected
+    with pytest.raises(RoutingPolicyError, match="Provider identity mismatch: OllamaProvider cannot be"):
+        ChatOrchestrator(
+            settings=both_configured_settings,
+            openai_provider=real_ollama,
+        )
+
+    # Injecting mismatched mapping rejected
+    with pytest.raises(RoutingPolicyError, match="Provider identity mismatch: OpenAIProvider cannot be"):
+        ChatOrchestrator(
+            settings=both_configured_settings,
+            providers={ProviderName.OLLAMA: real_openai},
+        )
+
+
+@pytest.mark.anyio
+async def test_orchestrator_rejects_injected_provider_with_unsafe_proxy(
+    both_configured_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.app.providers.ollama_provider import OllamaProvider
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.leak.corp:8080")
+    unsafe_client = httpx.AsyncClient(trust_env=True)
+
+    unsafe_ollama = OllamaProvider(
+        settings=both_configured_settings,
+        http_client=unsafe_client,
+    )
+    orchestrator = ChatOrchestrator(
+        settings=both_configured_settings,
+        ollama_provider=unsafe_ollama,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Classified info")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+    )
+
+    with pytest.raises(ProviderConfigurationError, match="proxy"):
+        await orchestrator.handle_chat_request(request)
+
+
+@pytest.mark.anyio
+async def test_remote_ollama_with_cloud_allowed_retains_proxy_compatibility() -> None:
+    from backend.app.providers.ollama_provider import OllamaProvider
+
+    settings = Settings(
+        OLLAMA_BASE_URL="http://remote-team-ollama.internal:11434",
+        OLLAMA_MODEL="llama3.2:latest",
+    )
+    orchestrator = ChatOrchestrator(settings=settings)
+
+    # Lazy instantiation under remote endpoint has trust_env=True dynamically
+    prov = orchestrator._get_provider(ProviderName.OLLAMA)
+    assert isinstance(prov, OllamaProvider)
+    assert prov._trust_env is None

@@ -14,7 +14,10 @@ from backend.app.providers.base import (
     ChatMessage,
     ProviderResponse,
 )
-from backend.app.providers.ollama_provider import OllamaProvider
+from backend.app.providers.ollama_provider import (
+    OllamaProvider,
+    validate_injected_client_for_local_endpoint,
+)
 from backend.app.providers.openai_provider import OpenAIProvider
 from backend.app.router.enums import PrivacyLevel, ProviderName
 from backend.app.router.policy import RoutingPolicyError, route_request
@@ -102,6 +105,41 @@ def validate_local_destination(url: str | None) -> None:
     )
 
 
+def validate_provider_identity(
+    expected_key: ConcreteProvider | ProviderName,
+    provider: Any,
+) -> None:
+    """Validate that an injected or resolved provider matches its registered routing key.
+
+    Prevents dependency-injection bypasses such as executing an OpenAIProvider
+    under the OLLAMA key.
+    """
+    if expected_key == ProviderName.OLLAMA:
+        if isinstance(provider, OpenAIProvider):
+            raise RoutingPolicyError(
+                "Provider identity mismatch: OpenAIProvider cannot be registered or "
+                "executed under provider key 'ollama'."
+            )
+        name = getattr(provider, "name", None)
+        if isinstance(name, str) and name.lower() != "ollama":
+            raise RoutingPolicyError(
+                f"Provider identity mismatch: provider with name '{name}' cannot be "
+                "registered or executed under provider key 'ollama'."
+            )
+    elif expected_key == ProviderName.OPENAI:
+        if isinstance(provider, OllamaProvider):
+            raise RoutingPolicyError(
+                "Provider identity mismatch: OllamaProvider cannot be registered or "
+                "executed under provider key 'openai'."
+            )
+        name = getattr(provider, "name", None)
+        if isinstance(name, str) and name.lower() != "openai":
+            raise RoutingPolicyError(
+                f"Provider identity mismatch: provider with name '{name}' cannot be "
+                "registered or executed under provider key 'openai'."
+            )
+
+
 def convert_messages(messages: Sequence[ChatMessageInput]) -> list[ChatMessage]:
     """Convert validated client message inputs into provider-level chat messages.
 
@@ -139,12 +177,15 @@ class ChatOrchestrator:
         if providers:
             for key, provider in providers.items():
                 norm_key = ProviderName(key) if isinstance(key, str) else key
+                validate_provider_identity(norm_key, provider)
                 self._providers[norm_key] = provider
 
         if ollama_provider is not None:
+            validate_provider_identity(ProviderName.OLLAMA, ollama_provider)
             self._providers[ProviderName.OLLAMA] = ollama_provider
 
         if openai_provider is not None:
+            validate_provider_identity(ProviderName.OPENAI, openai_provider)
             self._providers[ProviderName.OPENAI] = openai_provider
 
     def _resolve_provider_endpoint(
@@ -168,7 +209,7 @@ class ChatOrchestrator:
             return self._providers[provider_name]
 
         if provider_name == ProviderName.OLLAMA:
-            provider = OllamaProvider(settings=self._settings, trust_env=False)
+            provider = OllamaProvider(settings=self._settings)
             self._providers[ProviderName.OLLAMA] = provider
             return provider
 
@@ -192,7 +233,10 @@ class ChatOrchestrator:
         # 1. Authoritative deterministic routing
         decision: RoutingDecision = route_request(request, settings=self._settings)
 
-        # 2. Defense-in-depth privacy boundary enforcement
+        # 2. Defense-in-depth privacy boundary and provider identity enforcement
+        provider = self._get_provider(decision.selected_provider)
+        validate_provider_identity(decision.selected_provider, provider)
+
         if request.privacy_level == PrivacyLevel.LOCAL_ONLY:
             if decision.selected_provider != ProviderName.OLLAMA:
                 raise RoutingPolicyError(
@@ -200,15 +244,24 @@ class ChatOrchestrator:
                     f"cannot execute provider '{decision.selected_provider}'."
                 )
 
+            # Ensure provider is strictly local (defense-in-depth)
+            if isinstance(provider, OpenAIProvider) or getattr(provider, "name", "").lower() != "ollama":
+                raise RoutingPolicyError(
+                    "Privacy boundary violation: non-local provider cannot execute under LOCAL_ONLY."
+                )
+
             # Enforce that LOCAL_ONLY destination is strictly a verified local loopback endpoint
             endpoint = self._resolve_provider_endpoint(decision.selected_provider)
             validate_local_destination(endpoint)
 
+            # Enforce that injected provider transports do not have proxy mounts or active proxy leakage
+            if hasattr(provider, "_http_client") and provider._http_client is not None:
+                validate_injected_client_for_local_endpoint(provider._http_client)
+
         # 3. Message conversion
         provider_messages = convert_messages(request.messages)
 
-        # 4. Provider resolution & execution
-        provider = self._get_provider(decision.selected_provider)
+        # 4. Provider execution
         provider_response = await provider.generate(provider_messages)
 
         # 5. Output validation

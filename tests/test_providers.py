@@ -1068,3 +1068,45 @@ async def test_injected_client_with_proxy_allowed_for_remote_destination() -> No
         resp = await provider.generate([ChatMessage(role="user", content="hello")])
         assert resp.content == "remote proxy reply"
 
+
+@pytest.mark.anyio
+async def test_ollama_provider_explicit_trust_env_true_on_loopback_still_disables_proxies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.evil.corp:8080")
+    monkeypatch.setenv("ALL_PROXY", "http://proxy.evil.corp:8080")
+
+    recorded_kwargs: dict[str, object] = {}
+
+    class InterceptClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            recorded_kwargs.update(kwargs)
+
+        async def __aenter__(self) -> "InterceptClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            pass
+
+        async def post(self, url: str, json: dict[str, object]) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"message": {"role": "assistant", "content": "direct reply"}},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", InterceptClient)
+
+    # Even with trust_env=True explicitly configured, loopback MUST force trust_env=False
+    provider = OllamaProvider(
+        settings=Settings(
+            OLLAMA_BASE_URL="http://127.0.0.1:11434",
+            OLLAMA_MODEL="small-model",
+        ),
+        trust_env=True,
+    )
+
+    resp = await provider.generate([ChatMessage(role="user", content="hello")])
+    assert resp.content == "direct reply"
+    assert recorded_kwargs.get("trust_env") is False
+

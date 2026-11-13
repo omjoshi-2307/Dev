@@ -113,14 +113,14 @@ class OllamaProvider:
         }
 
         is_local = is_loopback_url(base_url)
-        # For local loopback destinations, trust_env defaults to False to prevent
-        # environment proxy variables (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY) from
-        # intercepting or leaking private local requests. Remote endpoints default
-        # to trust_env=True to support legitimate proxies under CLOUD_ALLOWED.
-        effective_trust_env = (
-            self._trust_env
-            if self._trust_env is not None
-            else not is_local
+        # For local loopback destinations, trust_env is unconditionally False.
+        # Explicit trust_env=True must never override this for loopback destinations,
+        # ensuring environment proxy variables (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY)
+        # cannot intercept or leak private local requests.
+        # Remote endpoints default to trust_env=True (or explicit self._trust_env)
+        # to support legitimate outbound proxies under CLOUD_ALLOWED.
+        effective_trust_env = False if is_local else (
+            self._trust_env if self._trust_env is not None else True
         )
 
         if self._http_client is not None:
