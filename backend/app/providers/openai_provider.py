@@ -1,6 +1,7 @@
 """OpenAI Responses API adapter using httpx."""
 
 import asyncio
+import math
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -17,6 +18,7 @@ from backend.app.providers.base import (
 
 DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1/responses"
 MAX_RETRIES = 2
+MAX_CONFIGURED_RETRIES = 5
 DEFAULT_RETRY_BACKOFF_SECONDS = 0.5
 MAX_RETRY_AFTER_SECONDS = 30.0
 _PERMANENT_QUOTA_CODES = frozenset(
@@ -142,11 +144,15 @@ class OpenAIProvider:
         retry_backoff: float = DEFAULT_RETRY_BACKOFF_SECONDS,
     ) -> None:
         self._settings = settings or get_settings()
-        self._timeout = timeout
-        if max_retries < 0:
-            raise ValueError("max_retries must be zero or greater.")
-        if retry_backoff < 0:
-            raise ValueError("retry_backoff must be zero or greater.")
+        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be a finite number greater than zero.")
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int):
+            raise ValueError("max_retries must be an integer.")
+        if not 0 <= max_retries <= MAX_CONFIGURED_RETRIES:
+            raise ValueError(f"max_retries must be between 0 and {MAX_CONFIGURED_RETRIES}.")
+        if not isinstance(retry_backoff, (int, float)) or not math.isfinite(retry_backoff) or retry_backoff < 0:
+            raise ValueError("retry_backoff must be a finite number zero or greater.")
+        self._timeout = float(timeout)
         self._max_retries = max_retries
         self._retry_backoff = retry_backoff
 
@@ -183,16 +189,16 @@ class OpenAIProvider:
                         min(self._retry_backoff * (2**attempt), MAX_RETRY_AFTER_SECONDS)
                     )
                     continue
-                raise TimeoutError("OpenAI request timed out.") from exc
+                raise TimeoutError("OpenAI request timed out.") from None
             except httpx.RequestError as exc:
                 if attempt < self._max_retries:
                     await asyncio.sleep(
                         min(self._retry_backoff * (2**attempt), MAX_RETRY_AFTER_SECONDS)
                     )
                     continue
-                raise ConnectionError("Failed to connect to OpenAI API.") from exc
+                raise ConnectionError("Failed to connect to OpenAI API.") from None
 
-            retryable_status = response.status_code >= 500 or (
+            retryable_status = 500 <= response.status_code < 600 or (
                 response.status_code == 429
                 and not _is_permanent_quota_error(response)
             )
@@ -278,7 +284,7 @@ class OpenAIProvider:
         except (ValueError, TypeError) as exc:
             raise ValueError(
                 "OpenAI returned a malformed non-JSON response."
-            ) from exc
+            ) from None
 
         return ProviderResponse(
             content=extract_output_text(data),
