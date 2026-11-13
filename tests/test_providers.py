@@ -15,6 +15,8 @@ from backend.app.providers.openai_provider import (
     DEFAULT_OPENAI_ENDPOINT,
     OpenAIProvider,
     extract_output_text,
+    sanitize_error_text,
+    validate_openai_endpoint,
 )
 
 
@@ -233,9 +235,12 @@ def test_openai_provider_handles_500_server_error() -> None:
 
     with pytest.raises(
         RuntimeError,
-        match="OpenAI service error \\(500\\): The server had an error",
-    ):
+        match="OpenAI service error \\(500\\): Upstream server error.",
+    ) as exc_info:
         asyncio.run(run())
+
+    # Server error body is concealed to prevent leakage
+    assert "The server had an error" not in str(exc_info.value)
 
 
 def test_openai_provider_handles_timeout() -> None:
@@ -461,7 +466,10 @@ def test_openai_provider_client_cleanup() -> None:
     settings = Settings(OPENAI_API_KEY="test-key", OPENAI_MODEL="gpt-4o-mini")
     provider = OpenAIProvider(settings=settings)
 
-    with patch("backend.app.providers.openai_provider.httpx.AsyncClient", MockAsyncClient):
+    with patch(
+        "backend.app.providers.openai_provider.httpx.AsyncClient",
+        MockAsyncClient,
+    ):
         result = asyncio.run(
             provider.generate([ChatMessage(role="user", content="Test cleanup")])
         )
@@ -493,6 +501,181 @@ def test_openai_provider_backwards_compatibility_legacy_client() -> None:
         model="test-model",
         input=[{"role": "user", "content": "Hello"}],
     )
+
+
+# ---------------------------------------------------------------------------
+# PR #4 Security Review Regression Tests
+# ---------------------------------------------------------------------------
+
+
+def test_untrusted_http_endpoint_cannot_receive_credentials() -> None:
+    captured_request = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured_request
+        captured_request = True
+        return httpx.Response(200, json={"output": []})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            settings = Settings(
+                OPENAI_API_KEY="sensitive-secret-key-12345",
+                OPENAI_MODEL="gpt-4o-mini",
+            )
+            provider = OpenAIProvider(
+                settings=settings,
+                http_client=client,
+                endpoint="http://api.openai.com/v1/responses",
+            )
+            await provider.generate([ChatMessage(role="user", content="Hi")])
+
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="Insecure endpoint scheme 'http'. OpenAI endpoints must use HTTPS.",
+    ):
+        asyncio.run(run())
+
+    # The untrusted HTTP endpoint was never reached and received no credentials
+    assert captured_request is False
+
+
+def test_untrusted_external_https_endpoint_cannot_receive_credentials() -> None:
+    captured_request = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured_request
+        captured_request = True
+        return httpx.Response(200, json={"output": []})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            settings = Settings(
+                OPENAI_API_KEY="sensitive-secret-key-12345",
+                OPENAI_MODEL="gpt-4o-mini",
+            )
+            provider = OpenAIProvider(
+                settings=settings,
+                http_client=client,
+                endpoint="https://malicious-external-proxy.example.com/v1/responses",
+            )
+            await provider.generate([ChatMessage(role="user", content="Hi")])
+
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="Untrusted endpoint host 'malicious-external-proxy.example.com'",
+    ):
+        asyncio.run(run())
+
+    # The untrusted external host was never reached and received no credentials
+    assert captured_request is False
+
+
+def test_mocked_429_response_does_not_expose_api_key() -> None:
+    test_key = "super-secret-key-999888"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={
+                "error": {
+                    "message": f"Rate limit exceeded for key {test_key}: please check usage limit.",
+                    "type": "insufficient_quota",
+                }
+            },
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            settings = Settings(
+                OPENAI_API_KEY=test_key,
+                OPENAI_MODEL="gpt-4o-mini",
+            )
+            provider = OpenAIProvider(settings=settings, http_client=client)
+            await provider.generate([ChatMessage(role="user", content="Hi")])
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(run())
+
+    error_msg = str(exc_info.value)
+    # The API key must never appear in the error message
+    assert test_key not in error_msg
+    assert "[REDACTED]" in error_msg
+    assert "OpenAI rate limit or quota exceeded" in error_msg
+
+
+def test_mocked_500_response_does_not_expose_sensitive_content() -> None:
+    sensitive_db_string = (
+        "postgresql://admin:super_secret_password@internal-db:5432/core"
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            json={
+                "error": {
+                    "message": f"Fatal crash in database query: {sensitive_db_string}",
+                    "type": "internal_error",
+                }
+            },
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            settings = Settings(
+                OPENAI_API_KEY="test-key",
+                OPENAI_MODEL="gpt-4o-mini",
+            )
+            provider = OpenAIProvider(settings=settings, http_client=client)
+            await provider.generate([ChatMessage(role="user", content="Hi")])
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(run())
+
+    error_msg = str(exc_info.value)
+    # Sensitive internal server error details must never be exposed
+    assert sensitive_db_string not in error_msg
+    assert "super_secret_password" not in error_msg
+    assert "500" in error_msg
+    assert "OpenAI service error (500): Upstream server error." in error_msg
+
+
+def test_validate_openai_endpoint_standalone() -> None:
+    with pytest.raises(ProviderConfigurationError, match="HTTPS"):
+        validate_openai_endpoint("http://api.openai.com/v1/responses")
+
+    with pytest.raises(ProviderConfigurationError, match="Untrusted endpoint host"):
+        validate_openai_endpoint("https://untrusted-host.com/v1/responses")
+
+    with pytest.raises(ProviderConfigurationError, match="non-empty string"):
+        validate_openai_endpoint("")
+
+    # Valid default endpoint succeeds without raising
+    validate_openai_endpoint(DEFAULT_OPENAI_ENDPOINT)
+
+
+def test_sanitize_error_text_scrubs_secrets_and_bearer_tokens() -> None:
+    raw_error = (
+        "Request failed for sk-1234567890abcdef and key-abcdef1234567890 with "
+        "Bearer secret-token-xyz123\nMore details."
+    )
+    sanitized = sanitize_error_text(
+        raw_error, secret_to_redact="secret-token-xyz123"
+    )
+
+    assert "sk-1234567890abcdef" not in sanitized
+    assert "key-abcdef1234567890" not in sanitized
+    assert "secret-token-xyz123" not in sanitized
+    assert "Bearer [REDACTED]" in sanitized
+    assert "[REDACTED]" in sanitized
+    assert "\n" not in sanitized
 
 
 # ---------------------------------------------------------------------------

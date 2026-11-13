@@ -1,7 +1,9 @@
 """OpenAI Responses API adapter using httpx."""
 
 from collections.abc import Sequence
+import re
 from typing import Any
+import urllib.parse
 
 import httpx
 
@@ -13,6 +15,105 @@ from backend.app.providers.base import (
 )
 
 DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1/responses"
+TRUSTED_OPENAI_HOSTS: frozenset[str] = frozenset({"api.openai.com"})
+
+
+def validate_openai_endpoint(endpoint: str) -> None:
+    """Validate that the target endpoint uses HTTPS and a trusted OpenAI host.
+
+    Enforces strict HTTPS and prevents transmitting credentials to arbitrary
+    or unapproved hostnames.
+    """
+    if not endpoint or not isinstance(endpoint, str):
+        raise ProviderConfigurationError("OpenAI endpoint must be a non-empty string.")
+
+    try:
+        parsed = urllib.parse.urlsplit(endpoint.strip())
+    except Exception as exc:
+        raise ProviderConfigurationError(
+            f"Invalid OpenAI endpoint URL: {endpoint}"
+        ) from exc
+
+    scheme = (parsed.scheme or "").lower()
+    if scheme != "https":
+        raise ProviderConfigurationError(
+            f"Insecure endpoint scheme '{scheme}'. OpenAI endpoints must use HTTPS."
+        )
+
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise ProviderConfigurationError(
+            f"Invalid OpenAI endpoint '{endpoint}': missing hostname."
+        )
+
+    if hostname not in TRUSTED_OPENAI_HOSTS:
+        raise ProviderConfigurationError(
+            f"Untrusted endpoint host '{hostname}'. OpenAI credentials will not be sent to untrusted hosts."
+        )
+
+
+def sanitize_error_text(text: str, secret_to_redact: str | None = None) -> str:
+    """Scrub sensitive credentials, tokens, and control characters from error text."""
+    if not text:
+        return ""
+
+    sanitized = text
+
+    # Redact known configured secret if provided
+    if secret_to_redact and secret_to_redact.strip():
+        sanitized = sanitized.replace(secret_to_redact.strip(), "[REDACTED]")
+
+    # Redact generic bearer tokens
+    sanitized = re.sub(
+        r"Bearer\s+[A-Za-z0-9\-._~+/]+=*",
+        "Bearer [REDACTED]",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+
+    # Redact common API key patterns (OpenAI sk-..., key-...)
+    sanitized = re.sub(r"\bsk-[A-Za-z0-9\-_]{8,}\b", "[REDACTED]", sanitized)
+    sanitized = re.sub(r"\bkey-[A-Za-z0-9\-_]{8,}\b", "[REDACTED]", sanitized)
+
+    # Normalize whitespace and collapse newlines
+    sanitized = " ".join(sanitized.split())
+
+    # Limit length to prevent log flooding with verbose upstream strings
+    if len(sanitized) > 200:
+        sanitized = sanitized[:197] + "..."
+
+    return sanitized
+
+
+def _extract_error_detail(
+    response: httpx.Response,
+    secret_to_redact: str | None = None,
+) -> str:
+    """Safely extract error message details without including raw upstream bodies or leaking secrets."""
+    # Never parse or include raw response bodies for server errors (5xx)
+    if response.status_code >= 500:
+        return "Upstream server error."
+
+    # For client errors (4xx), only extract structured message field from JSON
+    try:
+        data = response.json()
+        if isinstance(data, dict):
+            error = data.get("error")
+            if isinstance(error, dict):
+                message = error.get("message")
+                if isinstance(message, str) and message.strip():
+                    return sanitize_error_text(
+                        message, secret_to_redact=secret_to_redact
+                    )
+            elif isinstance(error, str) and error.strip():
+                return sanitize_error_text(
+                    error, secret_to_redact=secret_to_redact
+                )
+    except Exception:
+        pass
+
+    # Never include raw response.text; fall back to safe HTTP status phrase
+    return f"HTTP {response.status_code}"
 
 
 def extract_output_text(data: dict[str, Any]) -> str:
@@ -63,22 +164,6 @@ def extract_output_text(data: dict[str, Any]) -> str:
         return output_text
 
     raise ValueError("OpenAI response missing expected 'output' field.")
-
-
-def _extract_error_detail(response: httpx.Response) -> str:
-    """Safely extract error message details from an HTTP response without leaking secrets."""
-    try:
-        data = response.json()
-        if isinstance(data, dict):
-            error = data.get("error")
-            if isinstance(error, dict) and "message" in error:
-                return str(error["message"])
-            if isinstance(error, str):
-                return error
-    except Exception:
-        pass
-    text = response.text.strip()
-    return text if text else f"HTTP {response.status_code}"
 
 
 class OpenAIProvider:
@@ -151,6 +236,9 @@ class OpenAIProvider:
                 model=model,
             )
 
+        # Enforce strict endpoint security before attaching credentials or sending requests
+        validate_openai_endpoint(self._endpoint)
+
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -188,17 +276,17 @@ class OpenAIProvider:
             )
 
         if response.status_code == 429:
-            detail = _extract_error_detail(response)
+            detail = _extract_error_detail(response, secret_to_redact=api_key)
             raise RuntimeError(f"OpenAI rate limit or quota exceeded: {detail}")
 
         if response.status_code >= 500:
-            detail = _extract_error_detail(response)
+            detail = _extract_error_detail(response, secret_to_redact=api_key)
             raise RuntimeError(
                 f"OpenAI service error ({response.status_code}): {detail}"
             )
 
         if response.is_error:
-            detail = _extract_error_detail(response)
+            detail = _extract_error_detail(response, secret_to_redact=api_key)
             raise RuntimeError(
                 f"OpenAI request failed ({response.status_code}): {detail}"
             )

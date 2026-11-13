@@ -109,19 +109,19 @@ The adapter uses `httpx` directly rather than invoking the official `openai` Pyt
 - **Root Cause & Platform Constraint:** Under Windows systems with active Windows Defender Application Control (WDAC) or Smart App Control signing policies (e.g., policy `0283ac0f-fff1-49ae-ada1-8a933130cad6`), dynamic native libraries (`.pyd` files) within user directories are blocked by Code Integrity (Event ID 3077/3033). The official `openai` SDK imports `jiter` (`jiter.cp315-win_amd64.pyd`), a compiled Rust JSON accelerator with no pure-Python fallback. This caused an unconditional `ImportError: DLL load failed while importing jiter` on Windows.
 - **Architectural Alignment:** DEV's `OllamaProvider` already relies on `httpx` for asynchronous HTTP communication. Implementing `OpenAIProvider` with `httpx` establishes design uniformity across all provider adapters, operates purely in Python without binary extensions, and avoids weakening host operating system security controls.
 
-#### Protocol & Schema Mapping
+#### Protocol, Endpoint Security & Schema Mapping
 
-- **Endpoint:** `https://api.openai.com/v1/responses` (POST).
+- **Fixed Endpoint & Host Policy:** The adapter uses the fixed HTTPS endpoint `https://api.openai.com/v1/responses`. To prevent credential exfiltration or accidental transmission across cleartext networks, `OpenAIProvider` strictly enforces HTTPS and validates that target hosts reside in an approved trusted-host list (`api.openai.com`). Insecure schemes (`http://`) or untrusted external hosts are rejected with a `ProviderConfigurationError` before any network request is issued or authorization headers are generated.
 - **Role Translation:** The Responses API specifies the `developer` role rather than the legacy `system` role. `OpenAIProvider` automatically translates incoming `ChatMessage(role="system", ...)` to `{"role": "developer", ...}` in the payload.
 - **Output Parsing:** The Responses API returns an `output` array of message objects containing content elements of type `output_text`. `OpenAIProvider.extract_output_text` reconstructs the concatenated text from all text parts while also supporting direct top-level `output_text` payloads for test and mock compatibility.
 
-#### Error Handling and Credential Protection
+#### Error Handling, Sanitization, and Credential Protection
 
-- **Credential Safety:** Server-side `OPENAI_API_KEY` is loaded securely via Pydantic `Settings`. Sensitive credentials are never exposed in log outputs, exception traces, or client-facing errors.
-- **Authentication Failures (HTTP 401):** Mapped to `ProviderConfigurationError` with a sanitized message to prevent leaking partial API keys or token fragments.
-- **Rate Limits & Quotas (HTTP 429):** Mapped to `RuntimeError` detailing quota or rate-limit exhaustion.
-- **Server Errors (HTTP 5xx):** Mapped to `RuntimeError` with HTTP status code and upstream diagnostic message.
-- **Timeouts & Network Faults:** Mapped to standard Python `TimeoutError` (`httpx.TimeoutException`) and `ConnectionError` (`httpx.RequestError`).
+- **Credential Safety & Redaction:** Server-side `OPENAI_API_KEY` is loaded securely via Pydantic `Settings`. Sensitive credentials are scrubbed by `sanitize_error_text`, which redacts explicit API keys, bearer tokens, and `sk-...` / `key-...` patterns from error details. Raw upstream response bodies are never reflected directly into exception strings.
+- **Authentication Failures (HTTP 401):** Mapped to `ProviderConfigurationError` with a fixed sanitized message (`OpenAI authentication failed: Invalid or unauthorized API key.`) to prevent leaking partial API keys or token fragments.
+- **Rate Limits & Quotas (HTTP 429):** Mapped to `RuntimeError` detailing quota or rate-limit exhaustion, with all credentials scrubbed and length bounded.
+- **Server Errors (HTTP 5xx):** Mapped to `RuntimeError` preserving the HTTP status code (e.g., `OpenAI service error (500): Upstream server error.`) while completely concealing upstream response bodies, stack traces, and internal server diagnostics.
+- **Timeouts & Network Faults:** Mapped to standard Python `TimeoutError` (`httpx.TimeoutException`) and `ConnectionError` (`httpx.RequestError`), sanitizing network exception classes without leaking connection strings.
 - **Malformed Outputs:** Non-JSON responses or empty/whitespace-only output payloads raise `ValueError`.
 
 ### Ollama Local Adapter (`OllamaProvider`)
