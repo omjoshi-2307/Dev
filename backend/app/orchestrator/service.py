@@ -147,6 +147,40 @@ def validate_provider_identity(
             )
 
 
+def validate_trusted_local_ollama_provider(provider: Any) -> None:
+    """Validate that provider is the exact, unmodified, trusted OllamaProvider implementation.
+
+    Enforces that LOCAL_ONLY requests can only execute through the genuine,
+    un-subclassed, and un-overridden OllamaProvider adapter, preventing privacy
+    boundary bypasses via subclassing, custom classes, or instance-level method monkeypatching.
+    """
+    if type(provider) is not OllamaProvider:
+        prov_cls_name = getattr(provider, "__class__", type(provider)).__name__
+        raise RoutingPolicyError(
+            f"Privacy boundary violation: LOCAL_ONLY requests require the exact trusted "
+            f"OllamaProvider adapter; custom or subclassed provider '{prov_cls_name}' is rejected."
+        )
+
+    # Reject instance-level method monkeypatching or overriding
+    if "generate" in getattr(provider, "__dict__", {}):
+        raise RoutingPolicyError(
+            "Privacy boundary violation: LOCAL_ONLY requests reject OllamaProvider instances "
+            "with overridden 'generate' methods."
+        )
+
+    # Verify that the effective generate method is the original OllamaProvider.generate implementation
+    gen_method = getattr(provider, "generate", None)
+    if not callable(gen_method):
+        raise RoutingPolicyError(
+            "Privacy boundary violation: OllamaProvider missing callable 'generate' method."
+        )
+
+    if getattr(gen_method, "__func__", None) is not OllamaProvider.generate:
+        raise RoutingPolicyError(
+            "Privacy boundary violation: OllamaProvider 'generate' method has been modified or overridden."
+        )
+
+
 def convert_messages(messages: Sequence[ChatMessageInput]) -> list[ChatMessage]:
     """Convert validated client message inputs into provider-level chat messages.
 
@@ -258,14 +292,9 @@ class ChatOrchestrator:
                     f"cannot execute provider '{decision.selected_provider}'."
                 )
 
-            # Ensure provider is strictly a verified OllamaProvider adapter
-            # A matching .name string alone does not establish safety; custom/fake providers are rejected
-            if not isinstance(provider, OllamaProvider):
-                raise RoutingPolicyError(
-                    f"Privacy boundary violation: LOCAL_ONLY requests require a verified "
-                    f"OllamaProvider adapter; custom or unverifiable provider "
-                    f"'{provider.__class__.__name__}' is rejected."
-                )
+            # Ensure provider is strictly the exact trusted OllamaProvider implementation.
+            # Subclasses and custom implementations overriding generate() are rejected.
+            validate_trusted_local_ollama_provider(provider)
 
             # Enforce that LOCAL_ONLY destination is strictly a verified local loopback endpoint
             # Resolved directly from the provider itself (never inferred from unrelated orchestrator settings)

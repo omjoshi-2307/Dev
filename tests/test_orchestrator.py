@@ -550,32 +550,30 @@ async def test_openai_runtime_failure_does_not_invoke_ollama(
 async def test_provider_identity_mismatch_handled_safely(
     both_configured_settings: Settings,
 ) -> None:
-    # A real OllamaProvider subclass returning mismatched response metadata
-    class MismatchedOllamaProvider(OllamaProvider):
-        async def generate(self, messages: Sequence[ChatMessage]) -> ProviderResponse:
-            return ProviderResponse(
-                content="Model response",
-                provider="untrusted-vendor",
-                model="alien-model-v99",
-            )
-
-    ollama_mismatch = MismatchedOllamaProvider(settings=both_configured_settings)
+    # Under CLOUD_ALLOWED, the provider returns mismatched response identity metadata
+    openai_mock = MockProvider(
+        name="openai",
+        response_content="Model response",
+        response_provider="untrusted-vendor",
+        response_model="alien-model-v99",
+    )
 
     orchestrator = ChatOrchestrator(
         settings=both_configured_settings,
-        ollama_provider=ollama_mismatch,
+        openai_provider=openai_mock,
     )
 
     request = ChatRequest(
         messages=[ChatMessageInput(role="user", content="Check identity")],
-        privacy_level=PrivacyLevel.LOCAL_ONLY,
+        privacy_level=PrivacyLevel.CLOUD_ALLOWED,
+        preferred_provider=ProviderName.OPENAI,
     )
 
     response = await orchestrator.handle_chat_request(request)
 
     # Response must strictly reflect the authoritative routing decision
-    assert response.provider == ProviderName.OLLAMA
-    assert response.model == "llama3.2:latest"
+    assert response.provider == ProviderName.OPENAI
+    assert response.model == "gpt-4o-mini"
     # Identity mismatch safely documented in metadata
     assert response.metadata.get("identity_mismatch") is True
     assert response.metadata.get("provider_reported_name") == "untrusted-vendor"
@@ -621,19 +619,19 @@ async def test_empty_or_whitespace_provider_output(
 async def test_invalid_provider_response_type(
     both_configured_settings: Settings,
 ) -> None:
-    class BadReturnOllama(OllamaProvider):
-        async def generate(self, messages: Sequence[ChatMessage]) -> Any:
-            return {"not": "a ProviderResponse"}
-
-    ollama_bad = BadReturnOllama(settings=both_configured_settings)
+    openai_bad = MockProvider(
+        name="openai",
+        raw_response={"not": "a ProviderResponse"},
+    )
     orchestrator = ChatOrchestrator(
         settings=both_configured_settings,
-        ollama_provider=ollama_bad,
+        openai_provider=openai_bad,
     )
 
     request = ChatRequest(
         messages=[ChatMessageInput(role="user", content="Expect answer")],
-        privacy_level=PrivacyLevel.LOCAL_ONLY,
+        privacy_level=PrivacyLevel.CLOUD_ALLOWED,
+        preferred_provider=ProviderName.OPENAI,
     )
 
     with pytest.raises(ValueError, match="invalid response object"):
@@ -895,23 +893,23 @@ def test_client_metadata_rejects_orchestrator_diagnostic_keys(
 async def test_normal_metadata_pass_through_and_diagnostic_integrity(
     both_configured_settings: Settings,
 ) -> None:
-    class MismatchedMetadataOllama(OllamaProvider):
-        async def generate(self, messages: Sequence[ChatMessage]) -> ProviderResponse:
-            return ProviderResponse(
-                content="Response",
-                provider="mismatched_provider_name",
-                model="mismatched_model_name",
-            )
-
-    ollama = MismatchedMetadataOllama(settings=both_configured_settings)
+    # Refactored to test response-normalization coverage through CLOUD_ALLOWED
+    # without relying on an overridden OllamaProvider executing under LOCAL_ONLY
+    openai_mismatch = MockProvider(
+        name="openai",
+        response_content="Response",
+        response_provider="mismatched_provider_name",
+        response_model="mismatched_model_name",
+    )
     orchestrator = ChatOrchestrator(
         settings=both_configured_settings,
-        ollama_provider=ollama,
+        openai_provider=openai_mismatch,
     )
 
     request = ChatRequest(
         messages=[ChatMessageInput(role="user", content="Hello")],
-        privacy_level=PrivacyLevel.LOCAL_ONLY,
+        privacy_level=PrivacyLevel.CLOUD_ALLOWED,
+        preferred_provider=ProviderName.OPENAI,
         metadata={
             "client_tracking_id": "track-456",
             "correlation_id": "corr-789",
@@ -931,8 +929,8 @@ async def test_normal_metadata_pass_through_and_diagnostic_integrity(
     assert response.metadata["provider_reported_model"] == "mismatched_model_name"
 
     # Authoritative provider and model reflect DEV routing, not provider self-reporting
-    assert response.provider == ProviderName.OLLAMA
-    assert response.model == "llama3.2:latest"
+    assert response.provider == ProviderName.OPENAI
+    assert response.model == "gpt-4o-mini"
 
 
 @pytest.mark.anyio
@@ -1194,7 +1192,7 @@ async def test_custom_provider_impersonating_ollama_cannot_execute_local_only(
 
     with pytest.raises(
         RoutingPolicyError,
-        match="LOCAL_ONLY requests require a verified OllamaProvider adapter",
+        match="LOCAL_ONLY requests require the exact trusted OllamaProvider adapter",
     ):
         await orchestrator.handle_chat_request(request)
 
@@ -1235,12 +1233,11 @@ async def test_injected_provider_own_endpoint_validated_not_orchestrator_setting
 async def test_injected_provider_without_base_url_rejected_for_local_only(
     both_configured_settings: Settings,
 ) -> None:
-    class NoBaseUrlOllama(OllamaProvider):
-        @property
-        def base_url(self) -> Any:
-            return None
-
-    no_url_ollama = NoBaseUrlOllama(settings=both_configured_settings)
+    empty_url_settings = Settings(
+        OLLAMA_MODEL="llama3.2:latest",
+        OLLAMA_BASE_URL="",
+    )
+    no_url_ollama = OllamaProvider(settings=empty_url_settings)
     orchestrator = ChatOrchestrator(
         settings=both_configured_settings,
         ollama_provider=no_url_ollama,
@@ -1256,4 +1253,169 @@ async def test_injected_provider_without_base_url_rejected_for_local_only(
         match="LOCAL_ONLY destination boundary violation: local provider endpoint is not configured",
     ):
         await orchestrator.handle_chat_request(request)
+
+
+# ---------------------------------------------------------------------------
+# Strict Trusted Adapter Implementation Enforcement Tests
+# ---------------------------------------------------------------------------
+def test_validate_trusted_local_ollama_provider_helper(
+    both_configured_settings: Settings,
+) -> None:
+    from backend.app.orchestrator.service import validate_trusted_local_ollama_provider
+
+    # 1. Exact, unmodified OllamaProvider instance passes
+    real_ollama = OllamaProvider(settings=both_configured_settings)
+    validate_trusted_local_ollama_provider(real_ollama)
+
+    # 2. Subclass without method override is rejected
+    class SubclassOllama(OllamaProvider):
+        pass
+
+    with pytest.raises(
+        RoutingPolicyError,
+        match="LOCAL_ONLY requests require the exact trusted OllamaProvider adapter",
+    ):
+        validate_trusted_local_ollama_provider(SubclassOllama(settings=both_configured_settings))
+
+    # 3. Subclass with overridden generate method is rejected
+    class SubclassOverrideOllama(OllamaProvider):
+        async def generate(self, messages: Sequence[ChatMessage]) -> ProviderResponse:
+            return ProviderResponse(content="compromised", provider="ollama", model="llama3.2:latest")
+
+    with pytest.raises(
+        RoutingPolicyError,
+        match="LOCAL_ONLY requests require the exact trusted OllamaProvider adapter",
+    ):
+        validate_trusted_local_ollama_provider(SubclassOverrideOllama(settings=both_configured_settings))
+
+    # 4. Instance-level method override on an exact OllamaProvider is rejected
+    overridden = OllamaProvider(settings=both_configured_settings)
+    async def fake_generate(messages: Sequence[ChatMessage]) -> ProviderResponse:
+        return ProviderResponse(content="compromised", provider="ollama", model="llama3.2:latest")
+
+    overridden.generate = fake_generate  # type: ignore[method-assign]
+    with pytest.raises(
+        RoutingPolicyError,
+        match="reject OllamaProvider instances with overridden 'generate' methods",
+    ):
+        validate_trusted_local_ollama_provider(overridden)
+
+    # 5. Custom class declaring name='ollama' is rejected
+    class CustomProvider:
+        name = "ollama"
+
+    with pytest.raises(
+        RoutingPolicyError,
+        match="LOCAL_ONLY requests require the exact trusted OllamaProvider adapter",
+    ):
+        validate_trusted_local_ollama_provider(CustomProvider())
+
+
+@pytest.mark.anyio
+async def test_subclass_overriding_generate_rejected_and_never_invoked_for_local_only(
+    both_configured_settings: Settings,
+) -> None:
+    invoked = False
+
+    class SubclassedOllamaProvider(OllamaProvider):
+        async def generate(self, messages: Sequence[ChatMessage]) -> ProviderResponse:
+            nonlocal invoked
+            invoked = True
+            return ProviderResponse(
+                content="exfiltrated data",
+                provider="ollama",
+                model="llama3.2:latest",
+            )
+
+    subclass_provider = SubclassedOllamaProvider(settings=both_configured_settings)
+    orchestrator = ChatOrchestrator(
+        settings=both_configured_settings,
+        ollama_provider=subclass_provider,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Top secret local info")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+    )
+
+    with pytest.raises(
+        RoutingPolicyError,
+        match="LOCAL_ONLY requests require the exact trusted OllamaProvider adapter",
+    ):
+        await orchestrator.handle_chat_request(request)
+
+    assert invoked is False
+
+
+@pytest.mark.anyio
+async def test_instance_level_override_of_generate_rejected_for_local_only(
+    both_configured_settings: Settings,
+) -> None:
+    invoked = False
+
+    async def custom_generate(messages: Sequence[ChatMessage]) -> ProviderResponse:
+        nonlocal invoked
+        invoked = True
+        return ProviderResponse(
+            content="exfiltrated data",
+            provider="ollama",
+            model="llama3.2:latest",
+        )
+
+    provider = OllamaProvider(settings=both_configured_settings)
+    provider.generate = custom_generate  # type: ignore[method-assign]
+
+    orchestrator = ChatOrchestrator(
+        settings=both_configured_settings,
+        ollama_provider=provider,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Top secret local info")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+    )
+
+    with pytest.raises(
+        RoutingPolicyError,
+        match="reject OllamaProvider instances with overridden 'generate' methods",
+    ):
+        await orchestrator.handle_chat_request(request)
+
+    assert invoked is False
+
+
+@pytest.mark.anyio
+async def test_trusted_adapter_validation_happens_before_message_conversion(
+    both_configured_settings: Settings,
+) -> None:
+    from unittest.mock import patch
+
+    class SubclassedOllama(OllamaProvider):
+        async def generate(self, messages: Sequence[ChatMessage]) -> ProviderResponse:
+            return ProviderResponse(
+                content="compromised",
+                provider="ollama",
+                model="llama3.2:latest",
+            )
+
+    orchestrator = ChatOrchestrator(
+        settings=both_configured_settings,
+        ollama_provider=SubclassedOllama(settings=both_configured_settings),
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Top secret local info")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+    )
+
+    with patch(
+        "backend.app.orchestrator.service.convert_messages",
+        side_effect=AssertionError("convert_messages must not be reached when adapter is untrusted!"),
+    ):
+        with pytest.raises(
+            RoutingPolicyError,
+            match="LOCAL_ONLY requests require the exact trusted OllamaProvider adapter",
+        ):
+            await orchestrator.handle_chat_request(request)
+
 
