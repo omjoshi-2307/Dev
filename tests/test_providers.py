@@ -826,3 +826,61 @@ def test_providers_reject_empty_message_lists() -> None:
         asyncio.run(openai_provider.generate([]))
     with pytest.raises(ValueError, match="At least one"):
         asyncio.run(ollama_provider.generate([]))
+
+def test_openai_provider_rejects_unbounded_or_invalid_retry_configuration() -> None:
+    settings = Settings(OPENAI_API_KEY="test-key", OPENAI_MODEL="test")
+    with pytest.raises(ValueError, match="max_retries must be between"):
+        OpenAIProvider(settings=settings, max_retries=6)
+    with pytest.raises(ValueError, match="max_retries must be an integer"):
+        OpenAIProvider(settings=settings, max_retries=True)
+    with pytest.raises(ValueError, match="timeout must be a finite number"):
+        OpenAIProvider(settings=settings, timeout=float("inf"))
+    with pytest.raises(ValueError, match="timeout must be a finite number"):
+        OpenAIProvider(settings=settings, timeout=0)
+    with pytest.raises(ValueError, match="retry_backoff must be a finite number"):
+        OpenAIProvider(settings=settings, retry_backoff=float("nan"))
+
+
+def test_openai_provider_suppresses_transport_exception_chaining() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("sensitive transport diagnostic")
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            provider = OpenAIProvider(
+                settings=Settings(OPENAI_API_KEY="test-key", OPENAI_MODEL="test"),
+                http_client=client,
+                max_retries=0,
+            )
+            await provider.generate([ChatMessage(role="user", content="Hi")])
+
+    with pytest.raises(ConnectionError) as exc_info:
+        asyncio.run(run())
+    assert str(exc_info.value) == "Failed to connect to OpenAI API."
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__suppress_context__ is True
+
+
+def test_openai_provider_suppresses_timeout_exception_chaining() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("sensitive timeout diagnostic")
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            provider = OpenAIProvider(
+                settings=Settings(OPENAI_API_KEY="test-key", OPENAI_MODEL="test"),
+                http_client=client,
+                max_retries=0,
+            )
+            await provider.generate([ChatMessage(role="user", content="Hi")])
+
+    with pytest.raises(TimeoutError) as exc_info:
+        asyncio.run(run())
+    assert str(exc_info.value) == "OpenAI request timed out."
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__suppress_context__ is True
+
