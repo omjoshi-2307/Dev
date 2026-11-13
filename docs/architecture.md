@@ -28,7 +28,7 @@
 | AI router | Provider selection, deterministic policy, and fallback rules | Schemas and deterministic policy implemented; execution and live health checks planned |
 | OpenAI adapter | Cloud model requests | Implemented |
 | Ollama adapter | Local model requests | Implemented |
-| Orchestrator | Conversation flow and tool-call lifecycle | Planned |
+| Orchestrator | Conversation flow and tool-call lifecycle | Internal chat orchestrator implemented (service layer connecting routing with providers, privacy enforcement, and response normalization); tool lifecycle and session persistence planned |
 | Memory hub | User-controlled memory and retrieval | Planned |
 | Context bridge | Approved context export/import | Planned |
 | Permissions | Authorization and confirmation gates | Planned |
@@ -129,6 +129,20 @@ The adapter uses `httpx` directly rather than invoking the official `openai` Pyt
 ### Ollama Local Adapter (`OllamaProvider`)
 
 Local model inference is implemented in `backend/app/providers/ollama_provider.py` communicating with the Ollama server at `OLLAMA_BASE_URL` (defaulting to `http://127.0.0.1:11434/api/chat`). All local requests are strictly non-streaming and execute within the local network perimeter.
+
+## Chat Orchestrator (`backend/app/orchestrator/service.py`)
+
+The Chat Orchestrator connects the deterministic routing engine with concrete AI provider adapters. It operates strictly as an internal service layer between input request validation and provider execution.
+
+### Architectural Responsibilities
+
+1. **Deterministic Execution:** Invokes `route_request()` to determine the authoritative provider and model selection.
+2. **Defense-in-Depth Privacy Enforcement:** Re-verifies that requests with `privacy_level="local_only"` never route to cloud providers (OpenAI).
+3. **Message Translation:** Converts validated `ChatMessageInput` objects into provider-level `ChatMessage` contracts while preserving role, content, and sequence order. Client-supplied system messages are strictly prohibited.
+4. **Provider Isolation & Execution:** Resolves or lazily instantiates the selected provider (`OllamaProvider` or `OpenAIProvider`) and executes generation.
+5. **No Automatic Runtime Fallback:** If a provider fails at runtime (e.g., connection timeout or daemon crash), the error is propagated immediately. A failed provider execution never triggers runtime fallback to an alternative provider, guaranteeing that failure modes remain predictable and that local requests never leak to the cloud on runtime error.
+6. **Response Normalization & Audit Integrity:** Returns a standardized `ChatResponse` containing generated text, authoritative provider, authoritative model, full `RoutingDecision` audit trail, and metadata. Inconsistent provider-reported identity fields are not trusted to override DEV's authoritative routing decision and are recorded as diagnostic metadata.
+7. **Testability & In-Memory Dependency Injection:** Supports constructor injection of provider adapters (`providers`, `ollama_provider`, `openai_provider`), enabling isolated unit testing without live network calls or filesystem dependencies.
 
 ## Memory boundaries
 
