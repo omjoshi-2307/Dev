@@ -95,6 +95,41 @@ In this stage, `AUTO` complexity does not invoke an AI classifier or dynamic heu
 
 Client metadata (`ChatRequest.metadata`) is untrusted and cannot override system instructions, security boundaries, or authoritative routing decisions.
 
+## Provider Adapters and Platform Integration
+
+DEV interfaces with AI models via standardized provider adapters that satisfy the `AIProvider` protocol (`backend/app/providers/base.py`).
+
+### OpenAI Responses API Adapter (`OpenAIProvider`)
+
+Cloud text generation is implemented in `backend/app/providers/openai_provider.py` targeting the OpenAI Responses API (`/v1/responses`).
+
+#### Implementation Rationale & Windows Code Integrity
+
+The adapter uses `httpx` directly rather than invoking the official `openai` Python SDK client.
+- **Root Cause & Platform Constraint:** Under Windows systems with active Windows Defender Application Control (WDAC) or Smart App Control signing policies (e.g., policy `0283ac0f-fff1-49ae-ada1-8a933130cad6`), dynamic native libraries (`.pyd` files) within user directories are blocked by Code Integrity (Event ID 3077/3033). The official `openai` SDK imports `jiter` (`jiter.cp315-win_amd64.pyd`), a compiled Rust JSON accelerator with no pure-Python fallback. This caused an unconditional `ImportError: DLL load failed while importing jiter` on Windows.
+- **Architectural Alignment:** DEV's `OllamaProvider` already relies on `httpx` for asynchronous HTTP communication. Implementing `OpenAIProvider` with `httpx` establishes design uniformity across all provider adapters, operates purely in Python without binary extensions, and avoids weakening host operating system security controls.
+
+#### Protocol, Endpoint Security & Schema Mapping
+
+- **Fixed Endpoint & Host Policy:** The adapter has no configurable endpoint parameter and sends credentials only to the exact canonical URL `https://api.openai.com/v1/responses`. The standalone validator rejects any non-identical URL, including alternate schemes, hosts, ports, paths, query strings, or embedded user information. Validation occurs before authorization headers are created or a network request is issued.
+- **Role Translation:** The Responses API specifies the `developer` role rather than the legacy `system` role. `OpenAIProvider` automatically translates incoming `ChatMessage(role="system", ...)` to `{"role": "developer", ...}` in the payload.
+- **Output Parsing:** The Responses API returns an `output` array of message objects containing content elements such as `output_text` or `refusal`. `OpenAIProvider.extract_output_text` reconstructs assistant text, including refusal text, while also supporting direct top-level `output_text` payloads for test and mock compatibility.
+
+#### Error Handling, Sanitization, and Credential Protection
+
+- **Credential Safety & Error Sanitization:** Server-side `OPENAI_API_KEY` is loaded via Pydantic `Settings`. HTTP exception messages never include provider-controlled error messages or raw response bodies. The adapter uses fixed descriptions and HTTP status codes only; provider-controlled diagnostic text is never reflected.
+- **Authentication Failures (HTTP 401):** Mapped to `ProviderConfigurationError` with a fixed sanitized message (`OpenAI authentication failed: Invalid or unauthorized API key.`) to prevent leaking partial API keys or token fragments.
+- **Rate Limits & Quotas (HTTP 429):** Transient rate limits are retried up to two times, honoring a valid bounded `Retry-After` value or using exponential backoff. Permanent quota/billing failures (for example, `insufficient_quota`) are not retried. Final errors use fixed descriptions and never include upstream message text.
+- **Server Errors (HTTP 5xx):** Retried up to two times with bounded exponential backoff, then mapped to `RuntimeError` preserving the HTTP status code (e.g., `OpenAI service error (500): Upstream server error.`) while concealing response bodies, stack traces, and internal diagnostics.
+- **Timeouts & Network Faults:** Transient timeout and request failures receive at most two retries by default. Exhausted timeouts map to Python `TimeoutError`; exhausted request failures map to `ConnectionError`. Transport exception chaining is suppressed so traceback logging does not reveal underlying transport diagnostics.
+- **Malformed Outputs:** Non-JSON responses or empty/whitespace-only output payloads raise `ValueError`.
+- **Constructor Compatibility:** The original second positional `client` argument remains reserved for legacy SDK-style clients. The HTTPX client is supplied by the keyword-only `http_client` parameter.
+- **Retry Bounds:** The default is two retries (three total attempts) for connection/timeout failures, transient HTTP 429 responses, and HTTP 5xx responses. Explicit configuration is limited to at most five retries; timeout and backoff values must be finite and valid. Permanent quota failures are not retried; all retry delays are bounded.
+
+### Ollama Local Adapter (`OllamaProvider`)
+
+Local model inference is implemented in `backend/app/providers/ollama_provider.py` communicating with the Ollama server at `OLLAMA_BASE_URL` (defaulting to `http://127.0.0.1:11434/api/chat`). All local requests are strictly non-streaming and execute within the local network perimeter.
+
 ## Memory boundaries
 
 Keep these concepts separate:
