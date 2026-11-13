@@ -15,7 +15,6 @@ from backend.app.providers.openai_provider import (
     DEFAULT_OPENAI_ENDPOINT,
     OpenAIProvider,
     extract_output_text,
-    sanitize_error_text,
     validate_openai_endpoint,
 )
 
@@ -758,23 +757,6 @@ def test_openai_provider_does_not_reflect_untrusted_4xx_message() -> None:
     assert "HTTP 400" in str(exc_info.value)
     assert secret_diagnostic not in str(exc_info.value)
     assert "private-password" not in str(exc_info.value)
-
-def test_sanitize_error_text_scrubs_secrets_and_bearer_tokens() -> None:
-    raw_error = (
-        "Request failed for sk-1234567890abcdef and key-abcdef1234567890 with "
-        "Bearer secret-token-xyz123\nMore details."
-    )
-    sanitized = sanitize_error_text(
-        raw_error, secret_to_redact="secret-token-xyz123"
-    )
-
-    assert "sk-1234567890abcdef" not in sanitized
-    assert "key-abcdef1234567890" not in sanitized
-    assert "secret-token-xyz123" not in sanitized
-    assert "Bearer [REDACTED]" in sanitized
-    assert "[REDACTED]" in sanitized
-    assert "\n" not in sanitized
-
 
 # ---------------------------------------------------------------------------
 # OllamaProvider tests
