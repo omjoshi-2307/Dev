@@ -106,13 +106,16 @@ def extract_output_text(data: dict[str, Any]) -> str:
                 content_list = item.get("content")
                 if isinstance(content_list, list):
                     for part in content_list:
-                        if (
-                            isinstance(part, dict)
-                            and part.get("type") == "output_text"
-                        ):
+                        if not isinstance(part, dict):
+                            continue
+                        if part.get("type") == "output_text":
                             text = part.get("text")
                             if isinstance(text, str):
                                 extracted.append(text)
+                        elif part.get("type") == "refusal":
+                            refusal = part.get("refusal")
+                            if isinstance(refusal, str):
+                                extracted.append(refusal)
 
         result = "".join(extracted)
         if not result.strip():
@@ -183,14 +186,14 @@ class OpenAIProvider:
                     headers=headers,
                     json=payload,
                 )
-            except httpx.TimeoutException as exc:
+            except httpx.TimeoutException:
                 if attempt < self._max_retries:
                     await asyncio.sleep(
                         min(self._retry_backoff * (2**attempt), MAX_RETRY_AFTER_SECONDS)
                     )
                     continue
                 raise TimeoutError("OpenAI request timed out.") from None
-            except httpx.RequestError as exc:
+            except httpx.RequestError:
                 if attempt < self._max_retries:
                     await asyncio.sleep(
                         min(self._retry_backoff * (2**attempt), MAX_RETRY_AFTER_SECONDS)
@@ -281,7 +284,7 @@ class OpenAIProvider:
 
         try:
             data = response.json()
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError):
             raise ValueError(
                 "OpenAI returned a malformed non-JSON response."
             ) from None
