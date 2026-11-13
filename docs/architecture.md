@@ -117,7 +117,7 @@ The adapter uses `httpx` directly rather than invoking the official `openai` Pyt
 
 #### Error Handling, Sanitization, and Credential Protection
 
-- **Credential Safety & Error Sanitization:** Server-side `OPENAI_API_KEY` is loaded via Pydantic `Settings`. HTTP exception messages never include provider-controlled error messages or raw response bodies. The adapter uses fixed descriptions and HTTP status codes only; the local `sanitize_error_text` helper is not used to trust or expose upstream diagnostics.
+- **Credential Safety & Error Sanitization:** Server-side `OPENAI_API_KEY` is loaded via Pydantic `Settings`. HTTP exception messages never include provider-controlled error messages or raw response bodies. The adapter uses fixed descriptions and HTTP status codes only; provider-controlled diagnostic text is never reflected.
 - **Authentication Failures (HTTP 401):** Mapped to `ProviderConfigurationError` with a fixed sanitized message (`OpenAI authentication failed: Invalid or unauthorized API key.`) to prevent leaking partial API keys or token fragments.
 - **Rate Limits & Quotas (HTTP 429):** Transient rate limits are retried up to two times, honoring a valid bounded `Retry-After` value or using exponential backoff. Permanent quota/billing failures (for example, `insufficient_quota`) are not retried. Final errors use fixed descriptions and never include upstream message text.
 - **Server Errors (HTTP 5xx):** Retried up to two times with bounded exponential backoff, then mapped to `RuntimeError` preserving the HTTP status code (e.g., `OpenAI service error (500): Upstream server error.`) while concealing response bodies, stack traces, and internal diagnostics.
