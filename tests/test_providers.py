@@ -583,7 +583,7 @@ def test_mocked_500_response_does_not_expose_sensitive_content() -> None:
 
 
 def test_validate_openai_endpoint_standalone() -> None:
-    with pytest.raises(ProviderConfigurationError, match="HTTPS"):
+    with pytest.raises(ProviderConfigurationError, match="canonical endpoint"):
         validate_openai_endpoint("http://api.openai.com/v1/responses")
 
     invalid_endpoints = [
