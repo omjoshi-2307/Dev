@@ -130,6 +130,12 @@ The adapter uses `httpx` directly rather than invoking the official `openai` Pyt
 
 Local model inference is implemented in `backend/app/providers/ollama_provider.py` communicating with the Ollama server at `OLLAMA_BASE_URL` (defaulting to `http://127.0.0.1:11434/api/chat`). All local requests are strictly non-streaming and execute within the local network perimeter.
 
+#### Transport Privacy & Proxy Hardening
+
+- **Loopback Proxy Isolation:** For local loopback destinations (`localhost`, `127.0.0.0/8`, `::1`), `OllamaProvider` explicitly enforces `trust_env=False` on the internal `httpx.AsyncClient`. This guarantees that proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`) can never intercept, proxy, or redirect private local requests.
+- **Injected Client Boundary Enforcement:** Injected HTTPX clients used against local loopback endpoints are validated to ensure they have no proxy transports mounted and do not trust active proxy environment variables.
+- **Remote Endpoint Compatibility:** When configured with a non-loopback endpoint under `CLOUD_ALLOWED`, environment proxies remain supported (`trust_env=True` by default) for legitimate remote Ollama infrastructure.
+
 ## Chat Orchestrator (`backend/app/orchestrator/service.py`)
 
 The Chat Orchestrator connects the deterministic routing engine with concrete AI provider adapters. It operates strictly as an internal service layer between input request validation and provider execution.

@@ -900,3 +900,171 @@ def test_extract_output_text_preserves_model_refusal_text() -> None:
     }
     assert extract_output_text(payload) == "I cannot help with that request."
 
+
+# ---------------------------------------------------------------------------
+# OllamaProvider Proxy Hardening Tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_ollama_provider_loopback_disables_trust_env_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.evil.corp:8080")
+    monkeypatch.setenv("ALL_PROXY", "http://proxy.evil.corp:8080")
+
+    recorded_kwargs: dict[str, object] = {}
+
+    class InterceptClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            recorded_kwargs.update(kwargs)
+
+        async def __aenter__(self) -> "InterceptClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            pass
+
+        async def post(self, url: str, json: dict[str, object]) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"message": {"role": "assistant", "content": "direct reply"}},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", InterceptClient)
+
+    provider = OllamaProvider(
+        settings=Settings(
+            OLLAMA_BASE_URL="http://127.0.0.1:11434",
+            OLLAMA_MODEL="small-model",
+        )
+    )
+
+    resp = await provider.generate([ChatMessage(role="user", content="hello")])
+    assert resp.content == "direct reply"
+    assert recorded_kwargs.get("trust_env") is False
+
+
+@pytest.mark.anyio
+async def test_ollama_provider_remote_enables_trust_env_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded_kwargs: dict[str, object] = {}
+
+    class InterceptClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            recorded_kwargs.update(kwargs)
+
+        async def __aenter__(self) -> "InterceptClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            pass
+
+        async def post(self, url: str, json: dict[str, object]) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"message": {"role": "assistant", "content": "remote reply"}},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", InterceptClient)
+
+    provider = OllamaProvider(
+        settings=Settings(
+            OLLAMA_BASE_URL="http://remote-team-ollama.internal:11434",
+            OLLAMA_MODEL="small-model",
+        )
+    )
+
+    resp = await provider.generate([ChatMessage(role="user", content="hello")])
+    assert resp.content == "remote reply"
+    assert recorded_kwargs.get("trust_env") is True
+
+
+@pytest.mark.anyio
+async def test_injected_client_with_proxy_mount_rejected_for_local_loopback() -> None:
+    client = httpx.AsyncClient(proxy="http://proxy.evil.corp:8080", trust_env=False)
+    provider = OllamaProvider(
+        settings=Settings(
+            OLLAMA_BASE_URL="http://127.0.0.1:11434",
+            OLLAMA_MODEL="small-model",
+        ),
+        http_client=client,
+    )
+
+    with pytest.raises(ProviderConfigurationError, match="proxy"):
+        await provider.generate([ChatMessage(role="user", content="hello")])
+
+
+@pytest.mark.anyio
+async def test_injected_client_with_trust_env_and_active_proxy_rejected_for_local(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.evil.corp:8080")
+    client = httpx.AsyncClient(trust_env=True)
+
+    provider = OllamaProvider(
+        settings=Settings(
+            OLLAMA_BASE_URL="http://127.0.0.1:11434",
+            OLLAMA_MODEL="small-model",
+        ),
+        http_client=client,
+    )
+
+    with pytest.raises(ProviderConfigurationError, match="proxy"):
+        await provider.generate([ChatMessage(role="user", content="hello")])
+
+
+@pytest.mark.anyio
+async def test_injected_client_with_trust_env_false_accepted_for_local(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.evil.corp:8080")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"message": {"role": "assistant", "content": "safe loopback reply"}},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        trust_env=False,
+    ) as client:
+        provider = OllamaProvider(
+            settings=Settings(
+                OLLAMA_BASE_URL="http://127.0.0.1:11434",
+                OLLAMA_MODEL="small-model",
+            ),
+            http_client=client,
+        )
+
+        resp = await provider.generate([ChatMessage(role="user", content="hello")])
+        assert resp.content == "safe loopback reply"
+
+
+@pytest.mark.anyio
+async def test_injected_client_with_proxy_allowed_for_remote_destination() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"message": {"role": "assistant", "content": "remote proxy reply"}},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        trust_env=True,
+    ) as client:
+        provider = OllamaProvider(
+            settings=Settings(
+                OLLAMA_BASE_URL="http://remote.host:11434",
+                OLLAMA_MODEL="small-model",
+            ),
+            http_client=client,
+        )
+
+        resp = await provider.generate([ChatMessage(role="user", content="hello")])
+        assert resp.content == "remote proxy reply"
+

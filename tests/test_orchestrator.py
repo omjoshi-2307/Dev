@@ -3,6 +3,7 @@
 from collections.abc import Sequence
 from typing import Any
 
+import httpx
 import pytest
 
 from backend.app.config import Settings
@@ -868,3 +869,46 @@ async def test_normal_metadata_pass_through_and_diagnostic_integrity(
     # Authoritative provider and model reflect DEV routing, not provider self-reporting
     assert response.provider == ProviderName.OLLAMA
     assert response.model == "llama3.2:latest"
+
+
+@pytest.mark.anyio
+async def test_orchestrator_local_only_proxy_environment_isolation(
+    both_configured_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Set hostile proxy env vars attempting to redirect traffic
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.hostile.corp:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.hostile.corp:8080")
+    monkeypatch.setenv("ALL_PROXY", "http://proxy.hostile.corp:8080")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"message": {"role": "assistant", "content": "Local secure reply"}},
+        )
+
+    # OllamaProvider with trust_env=False and mock transport
+    from backend.app.providers.ollama_provider import OllamaProvider
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        trust_env=False,
+    ) as client:
+        real_ollama = OllamaProvider(
+            settings=both_configured_settings,
+            http_client=client,
+            trust_env=False,
+        )
+        orchestrator = ChatOrchestrator(
+            settings=both_configured_settings,
+            ollama_provider=real_ollama,
+        )
+
+        request = ChatRequest(
+            messages=[ChatMessageInput(role="user", content="Secret private prompt")],
+            privacy_level=PrivacyLevel.LOCAL_ONLY,
+        )
+
+        response = await orchestrator.handle_chat_request(request)
+        assert response.content == "Local secure reply"
+        assert response.provider == ProviderName.OLLAMA

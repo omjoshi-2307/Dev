@@ -168,7 +168,7 @@ class ChatOrchestrator:
             return self._providers[provider_name]
 
         if provider_name == ProviderName.OLLAMA:
-            provider = OllamaProvider(settings=self._settings)
+            provider = OllamaProvider(settings=self._settings, trust_env=False)
             self._providers[ProviderName.OLLAMA] = provider
             return provider
 
