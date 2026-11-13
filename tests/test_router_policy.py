@@ -479,3 +479,52 @@ def test_regression_default_auto_matrix_remains_unchanged(both_configured_settin
         complexity=TaskComplexity.AUTO,
     )
     assert route_request(req_auto, both_configured_settings).selected_provider == ProviderName.OLLAMA
+
+
+def test_regression_configured_default_openai_with_cloud_allowed_and_simple_complexity_selects_openai() -> None:
+    """Under CLOUD_ALLOWED, a configured default of OpenAI takes precedence over the SIMPLE complexity default."""
+    settings = Settings(
+        DEV_ROUTER_DEFAULT_PROVIDER="openai",
+        OPENAI_API_KEY="test-openai-key",
+        OPENAI_MODEL="gpt-4o-mini",
+        OLLAMA_MODEL="llama3.2:latest",
+    )
+    with patch("backend.app.config.get_settings", return_value=settings):
+        request = ChatRequest(
+            messages=[ChatMessageInput(role="user", content="Simple task with default cloud provider")],
+            privacy_level=PrivacyLevel.CLOUD_ALLOWED,
+            complexity=TaskComplexity.SIMPLE,
+        )
+        assert request.preferred_provider == ProviderName.OPENAI
+        assert "preferred_provider" not in request.model_fields_set
+
+        decision = route_request(request, settings)
+        assert decision.selected_provider == ProviderName.OPENAI
+        assert decision.model == "gpt-4o-mini"
+        assert decision.is_fallback is False
+        assert "Configured default provider is OpenAI" in decision.reason
+
+
+def test_regression_configured_default_ollama_with_cloud_allowed_and_complex_complexity_selects_ollama() -> None:
+    """Under CLOUD_ALLOWED, a configured default of Ollama takes precedence over the COMPLEX complexity default."""
+    settings = Settings(
+        DEV_ROUTER_DEFAULT_PROVIDER="ollama",
+        OPENAI_API_KEY="test-openai-key",
+        OPENAI_MODEL="gpt-4o-mini",
+        OLLAMA_MODEL="llama3.2:latest",
+    )
+    with patch("backend.app.config.get_settings", return_value=settings):
+        request = ChatRequest(
+            messages=[ChatMessageInput(role="user", content="Complex task with default local provider")],
+            privacy_level=PrivacyLevel.CLOUD_ALLOWED,
+            complexity=TaskComplexity.COMPLEX,
+        )
+        assert request.preferred_provider == ProviderName.OLLAMA
+        assert "preferred_provider" not in request.model_fields_set
+
+        decision = route_request(request, settings)
+        assert decision.selected_provider == ProviderName.OLLAMA
+        assert decision.model == "llama3.2:latest"
+        assert decision.is_fallback is False
+        assert "Configured default provider is Ollama" in decision.reason
+

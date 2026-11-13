@@ -63,6 +63,14 @@ When no explicit provider is specified (`preferred_provider="auto"`), routing ev
 - When fallback is disabled (`allow_fallback=False`), the router will never switch away from an explicitly preferred provider.
 - If an explicitly preferred provider is not configured, the policy raises a `RoutingPolicyError`.
 
+### Provider-Default Precedence
+
+Provider selection adheres to an unambiguous precedence hierarchy:
+1. **Explicit Client Preference:** An explicitly specified client preference (detected via Pydantic `model_fields_set`) takes precedence over all defaults and complexity evaluations, provided privacy rules permit it. An explicit client preference for `openai` under `LOCAL_ONLY` is immediately rejected.
+2. **Local Privacy Override:** Under `LOCAL_ONLY`, an inherited OpenAI default from environment configuration (`DEV_ROUTER_DEFAULT_PROVIDER="openai"`) is strictly overridden by the local privacy policy. The request routes safely to Ollama per automatic local policy rather than causing an error.
+3. **Configured Provider Defaults under `CLOUD_ALLOWED`:** Under `CLOUD_ALLOWED`, when no explicit client preference is provided, a configured non-AUTO provider default takes precedence over the automatic complexity matrix (e.g. default OpenAI routes to OpenAI even for `SIMPLE` tasks; default Ollama routes to Ollama even for `COMPLEX` tasks).
+4. **Automatic Complexity Matrix:** When the configured default is `AUTO` (or unspecified) and no explicit preference is provided, the automatic complexity matrix applies (`COMPLEX` + `CLOUD_ALLOWED` -> OpenAI; all other combinations -> Ollama).
+
 ### Fallback Restrictions
 
 Fallback to an alternative provider occurs only when all of the following conditions are met:
