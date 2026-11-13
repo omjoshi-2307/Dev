@@ -1,5 +1,7 @@
 """Unit tests for the DEV deterministic AI routing policy."""
 
+from unittest.mock import patch
+
 import pytest
 
 from backend.app.config import Settings
@@ -321,7 +323,6 @@ def test_auto_is_never_returned_as_selected_provider(both_configured_settings: S
 
 
 def test_untrusted_client_metadata_does_not_affect_routing(both_configured_settings: Settings) -> None:
-    # Metadata includes arbitrary client tracking data
     request = ChatRequest(
         messages=[ChatMessageInput(role="user", content="Prompt")],
         privacy_level=PrivacyLevel.LOCAL_ONLY,
@@ -330,5 +331,151 @@ def test_untrusted_client_metadata_does_not_affect_routing(both_configured_setti
     decision = route_request(request, both_configured_settings)
 
     assert decision.selected_provider == ProviderName.OLLAMA
-    # Ensure metadata was not forwarded or leaked into the authority decision metadata
     assert "client_agent" not in decision.metadata
+
+
+# --- Regression Tests: Distinguishing Explicit Preference from Configured Defaults ---
+
+
+def test_regression_explicit_openai_with_local_only_rejected() -> None:
+    settings = Settings(
+        DEV_ROUTER_DEFAULT_PROVIDER="auto",
+        OPENAI_API_KEY="test-openai-key",
+        OPENAI_MODEL="gpt-4o-mini",
+        OLLAMA_MODEL="llama3.2:latest",
+    )
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Explicit cloud command")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+        preferred_provider=ProviderName.OPENAI,
+    )
+    assert "preferred_provider" in request.model_fields_set
+
+    with pytest.raises(
+        RoutingPolicyError,
+        match="Explicit provider preference 'openai' violates privacy level 'local_only'",
+    ):
+        route_request(request, settings)
+
+
+def test_regression_configured_default_openai_with_local_only_selects_ollama() -> None:
+    """When default provider is configured as OpenAI, a LOCAL_ONLY request without explicit
+    preference must not be rejected; it routes to Ollama per automatic local policy."""
+    settings = Settings(
+        DEV_ROUTER_DEFAULT_PROVIDER="openai",
+        OPENAI_API_KEY="test-openai-key",
+        OPENAI_MODEL="gpt-4o-mini",
+        OLLAMA_MODEL="llama3.2:latest",
+    )
+    with patch("backend.app.config.get_settings", return_value=settings):
+        request = ChatRequest(
+            messages=[ChatMessageInput(role="user", content="Default local request")],
+            privacy_level=PrivacyLevel.LOCAL_ONLY,
+        )
+        assert request.preferred_provider == ProviderName.OPENAI
+        assert "preferred_provider" not in request.model_fields_set
+
+        decision = route_request(request, settings)
+        assert decision.selected_provider == ProviderName.OLLAMA
+        assert decision.model == "llama3.2:latest"
+        assert decision.is_fallback is False
+        assert "local_only" in decision.reason
+
+
+def test_regression_configured_default_openai_with_local_only_and_ollama_unavailable_raises_clear_error() -> None:
+    """When default provider is OpenAI and privacy is LOCAL_ONLY, if Ollama is not configured,
+    the router must raise a clear policy error and never fall back to OpenAI."""
+    settings = Settings(
+        DEV_ROUTER_DEFAULT_PROVIDER="openai",
+        OPENAI_API_KEY="test-openai-key",
+        OPENAI_MODEL="gpt-4o-mini",
+        OLLAMA_MODEL=None,
+    )
+    with patch("backend.app.config.get_settings", return_value=settings):
+        # Even with allow_fallback=True, cloud fallback is prohibited
+        request = ChatRequest(
+            messages=[ChatMessageInput(role="user", content="Local prompt")],
+            privacy_level=PrivacyLevel.LOCAL_ONLY,
+            allow_fallback=True,
+        )
+        assert "preferred_provider" not in request.model_fields_set
+
+        with pytest.raises(
+            RoutingPolicyError,
+            match="fallback to cloud provider 'openai' is strictly prohibited under 'local_only' privacy",
+        ):
+            route_request(request, settings)
+
+
+def test_regression_explicit_openai_with_cloud_allowed_selects_openai() -> None:
+    settings = Settings(
+        DEV_ROUTER_DEFAULT_PROVIDER="ollama",
+        OPENAI_API_KEY="test-openai-key",
+        OPENAI_MODEL="gpt-4o-mini",
+        OLLAMA_MODEL="llama3.2:latest",
+    )
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Explicit cloud request")],
+        privacy_level=PrivacyLevel.CLOUD_ALLOWED,
+        preferred_provider=ProviderName.OPENAI,
+    )
+    assert "preferred_provider" in request.model_fields_set
+
+    decision = route_request(request, settings)
+    assert decision.selected_provider == ProviderName.OPENAI
+    assert decision.model == "gpt-4o-mini"
+    assert decision.is_fallback is False
+
+
+def test_regression_explicit_ollama_with_cloud_allowed_selects_ollama() -> None:
+    settings = Settings(
+        DEV_ROUTER_DEFAULT_PROVIDER="openai",
+        OPENAI_API_KEY="test-openai-key",
+        OPENAI_MODEL="gpt-4o-mini",
+        OLLAMA_MODEL="llama3.2:latest",
+    )
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Explicit local request")],
+        privacy_level=PrivacyLevel.CLOUD_ALLOWED,
+        preferred_provider=ProviderName.OLLAMA,
+    )
+    assert "preferred_provider" in request.model_fields_set
+
+    decision = route_request(request, settings)
+    assert decision.selected_provider == ProviderName.OLLAMA
+    assert decision.model == "llama3.2:latest"
+    assert decision.is_fallback is False
+
+
+def test_regression_default_auto_matrix_remains_unchanged(both_configured_settings: Settings) -> None:
+    # 1. Simple + Cloud -> Ollama
+    req_simple = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Simple")],
+        privacy_level=PrivacyLevel.CLOUD_ALLOWED,
+        complexity=TaskComplexity.SIMPLE,
+    )
+    assert route_request(req_simple, both_configured_settings).selected_provider == ProviderName.OLLAMA
+
+    # 2. Complex + Cloud -> OpenAI
+    req_complex_cloud = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Complex")],
+        privacy_level=PrivacyLevel.CLOUD_ALLOWED,
+        complexity=TaskComplexity.COMPLEX,
+    )
+    assert route_request(req_complex_cloud, both_configured_settings).selected_provider == ProviderName.OPENAI
+
+    # 3. Complex + Local -> Ollama
+    req_complex_local = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Complex local")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+        complexity=TaskComplexity.COMPLEX,
+    )
+    assert route_request(req_complex_local, both_configured_settings).selected_provider == ProviderName.OLLAMA
+
+    # 4. Auto + Cloud -> Ollama
+    req_auto = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Auto")],
+        privacy_level=PrivacyLevel.CLOUD_ALLOWED,
+        complexity=TaskComplexity.AUTO,
+    )
+    assert route_request(req_auto, both_configured_settings).selected_provider == ProviderName.OLLAMA
