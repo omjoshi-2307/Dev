@@ -884,3 +884,19 @@ def test_openai_provider_suppresses_timeout_exception_chaining() -> None:
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__suppress_context__ is True
 
+def test_extract_output_text_preserves_model_refusal_text() -> None:
+    payload = {
+        "output": [
+            {
+                "type": "message",
+                "content": [
+                    {
+                        "type": "refusal",
+                        "refusal": "I cannot help with that request.",
+                    }
+                ],
+            }
+        ]
+    }
+    assert extract_output_text(payload) == "I cannot help with that request."
+
