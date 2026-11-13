@@ -113,7 +113,7 @@ The adapter uses `httpx` directly rather than invoking the official `openai` Pyt
 
 - **Fixed Endpoint & Host Policy:** The adapter has no configurable endpoint parameter and sends credentials only to the exact canonical URL `https://api.openai.com/v1/responses`. The standalone validator rejects any non-identical URL, including alternate schemes, hosts, ports, paths, query strings, or embedded user information. Validation occurs before authorization headers are created or a network request is issued.
 - **Role Translation:** The Responses API specifies the `developer` role rather than the legacy `system` role. `OpenAIProvider` automatically translates incoming `ChatMessage(role="system", ...)` to `{"role": "developer", ...}` in the payload.
-- **Output Parsing:** The Responses API returns an `output` array of message objects containing content elements of type `output_text`. `OpenAIProvider.extract_output_text` reconstructs the concatenated text from all text parts while also supporting direct top-level `output_text` payloads for test and mock compatibility.
+- **Output Parsing:** The Responses API returns an `output` array of message objects containing content elements such as `output_text` or `refusal`. `OpenAIProvider.extract_output_text` reconstructs assistant text, including refusal text, while also supporting direct top-level `output_text` payloads for test and mock compatibility.
 
 #### Error Handling, Sanitization, and Credential Protection
 
