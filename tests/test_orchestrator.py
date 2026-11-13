@@ -2,6 +2,7 @@
 
 from collections.abc import Sequence
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -1490,6 +1491,238 @@ async def test_orchestrator_local_only_redirect_attempt_does_not_forward_body(
     assert len(recorded_urls) == 1
     assert recorded_urls[0] == "http://127.0.0.1:11434/api/chat"
     assert "evil.remote.corp" not in recorded_urls[0]
+
+
+# ---------------------------------------------------------------------------
+# LOCAL_ONLY Trusted Injected HTTP Client Enforcement Tests
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_orchestrator_rejects_injected_custom_client_with_fake_safe_transport(
+    both_configured_settings: Settings,
+) -> None:
+    class FakeDirectClient:
+        def __init__(self) -> None:
+            self._transport = httpx.MockTransport(lambda req: httpx.Response(200))
+            self.trust_env = False
+            self.follow_redirects = False
+            self._mounts: dict[str, object] = {}
+
+    ollama = OllamaProvider(
+        settings=both_configured_settings,
+        http_client=FakeDirectClient(),
+    )
+    orchestrator = ChatOrchestrator(
+        settings=both_configured_settings,
+        ollama_provider=ollama,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Top secret local info")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+    )
+
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="must be an exact httpx.AsyncClient instance",
+    ):
+        await orchestrator.handle_chat_request(request)
+
+
+@pytest.mark.anyio
+async def test_orchestrator_rejects_async_client_subclass_overriding_post_and_never_invokes_it(
+    both_configured_settings: Settings,
+) -> None:
+    post_invoked = False
+
+    class SubclassedClient(httpx.AsyncClient):
+        async def post(self, *args: object, **kwargs: object) -> httpx.Response:
+            nonlocal post_invoked
+            post_invoked = True
+            return httpx.Response(
+                200,
+                json={"message": {"role": "assistant", "content": "exfiltrated"}},
+            )
+
+    client = SubclassedClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200)),
+        trust_env=False,
+    )
+    ollama = OllamaProvider(
+        settings=both_configured_settings,
+        http_client=client,
+    )
+    orchestrator = ChatOrchestrator(
+        settings=both_configured_settings,
+        ollama_provider=ollama,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Top secret local info")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+    )
+
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="must be an exact httpx.AsyncClient instance",
+    ):
+        await orchestrator.handle_chat_request(request)
+
+    assert post_invoked is False
+
+
+@pytest.mark.anyio
+async def test_orchestrator_rejects_exact_async_client_with_instance_level_post_override(
+    both_configured_settings: Settings,
+) -> None:
+    post_invoked = False
+
+    async def fake_post(*args: object, **kwargs: object) -> httpx.Response:
+        nonlocal post_invoked
+        post_invoked = True
+        return httpx.Response(200)
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200)),
+        trust_env=False,
+    )
+    client.__dict__["post"] = fake_post
+
+    ollama = OllamaProvider(
+        settings=both_configured_settings,
+        http_client=client,
+    )
+    orchestrator = ChatOrchestrator(
+        settings=both_configured_settings,
+        ollama_provider=ollama,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Top secret local info")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+    )
+
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="overridden 'post' method",
+    ):
+        await orchestrator.handle_chat_request(request)
+
+    assert post_invoked is False
+
+
+@pytest.mark.anyio
+async def test_orchestrator_injected_client_validation_fails_closed_before_message_conversion(
+    both_configured_settings: Settings,
+) -> None:
+    class SubclassedClient(httpx.AsyncClient):
+        pass
+
+    client = SubclassedClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200)),
+        trust_env=False,
+    )
+    ollama = OllamaProvider(
+        settings=both_configured_settings,
+        http_client=client,
+    )
+    orchestrator = ChatOrchestrator(
+        settings=both_configured_settings,
+        ollama_provider=ollama,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Top secret local info")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+    )
+
+    with patch(
+        "backend.app.orchestrator.service.convert_messages",
+        side_effect=AssertionError("convert_messages must not be reached when injected client is untrusted!"),
+    ):
+        with pytest.raises(
+            ProviderConfigurationError,
+            match="must be an exact httpx.AsyncClient instance",
+        ):
+            await orchestrator.handle_chat_request(request)
+
+
+@pytest.mark.anyio
+async def test_orchestrator_local_only_succeeds_with_exact_async_client_and_mock_transport(
+    both_configured_settings: Settings,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"message": {"role": "assistant", "content": "direct reply"}},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        trust_env=False,
+        follow_redirects=False,
+    )
+    ollama = OllamaProvider(
+        settings=both_configured_settings,
+        http_client=client,
+    )
+    orchestrator = ChatOrchestrator(
+        settings=both_configured_settings,
+        ollama_provider=ollama,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Hello local")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+    )
+
+    response = await orchestrator.handle_chat_request(request)
+    assert response.content == "direct reply"
+    assert response.provider == ProviderName.OLLAMA
+
+
+@pytest.mark.anyio
+async def test_orchestrator_cloud_allowed_remote_ollama_preserves_custom_client_behavior() -> None:
+    class CustomRemoteClient(httpx.AsyncClient):
+        pass
+
+    remote_settings = Settings(
+        OPENAI_API_KEY="test-openai-key",
+        OLLAMA_BASE_URL="https://ollama.corporate.remote:11434",
+        OLLAMA_MODEL="remote-model",
+        ROUTER_DEFAULT_PROVIDER=ProviderName.OLLAMA,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"message": {"role": "assistant", "content": "remote reply"}},
+            request=request,
+        )
+
+    client = CustomRemoteClient(
+        transport=httpx.MockTransport(handler),
+        trust_env=True,
+    )
+    ollama = OllamaProvider(
+        settings=remote_settings,
+        http_client=client,
+    )
+    orchestrator = ChatOrchestrator(
+        settings=remote_settings,
+        ollama_provider=ollama,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Hello remote")],
+        privacy_level=PrivacyLevel.CLOUD_ALLOWED,
+    )
+
+    response = await orchestrator.handle_chat_request(request)
+    assert response.content == "remote reply"
+    assert response.provider == ProviderName.OLLAMA
+
+
 
 
 

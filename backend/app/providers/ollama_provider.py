@@ -55,12 +55,16 @@ def is_loopback_url(url: str | None) -> bool:
 
 
 def validate_injected_client_for_local_endpoint(client: Any) -> None:
-    """Ensure an injected HTTP client does not route local traffic through proxies or unsafe transports.
+    """Ensure an injected HTTP client does not route local traffic through proxies, unsafe transports, or hijacked execution hooks.
 
     For local loopback endpoints (such as local Ollama instances under LOCAL_ONLY),
     all network traffic must be direct to prevent private message leakage.
 
     Inspection details and compatibility implications:
+    - Injected client must be an exact httpx.AsyncClient instance. Subclasses and custom
+      client wrappers are rejected because they can override request execution or routing logic.
+    - Bound `post` method must resolve directly to `httpx.AsyncClient.post` without instance-level
+      or class-level method overrides.
     - HTTPX encapsulates request routing in internal transports (`client._transport`)
       and optional mounted route dispatchers (`client._mounts`).
     - Standard direct async HTTPX clients use `httpx.AsyncHTTPTransport` backed by an
@@ -71,17 +75,32 @@ def validate_injected_client_for_local_endpoint(client: Any) -> None:
       and do not perform remote routing; these are verified as safe.
     - Custom, unknown, or unverifiable transports whose routing cannot be established as
       strictly direct and local are rejected to fail closed against potential data exfiltration.
-    - While checking `_transport`, `_pool`, and `_mounts` relies on HTTPX/httpcore internal
-      conventions, these checks are documented and validated against HTTPX's public and
-      internal architectures.
     """
     if client is None:
         return
 
-    # Injected client must be an httpx.AsyncClient or provide a verifiable async transport
-    if not hasattr(client, "_transport"):
+    # Injected client must be strictly the exact httpx.AsyncClient class;
+    # subclasses and custom client wrappers are rejected to prevent hijacked post() execution.
+    if type(client) is not httpx.AsyncClient:
+        client_cls_name = getattr(client, "__class__", type(client)).__name__
         raise ProviderConfigurationError(
-            "Injected HTTP client for local Ollama provider is not a valid or verifiable HTTPX client."
+            f"Injected HTTP client for local Ollama provider must be an exact httpx.AsyncClient instance; "
+            f"custom or subclassed client '{client_cls_name}' is not a valid or verifiable HTTPX client."
+        )
+
+    # Injected client must not have an instance-level override of post()
+    if "post" in getattr(client, "__dict__", {}):
+        raise ProviderConfigurationError(
+            "Injected HTTP client for local Ollama provider has an overridden 'post' method, "
+            "violating trusted client boundaries."
+        )
+
+    # Effective bound post method must resolve strictly to the original httpx.AsyncClient.post
+    post_method = getattr(client, "post", None)
+    if not callable(post_method) or getattr(post_method, "__func__", None) is not httpx.AsyncClient.post:
+        raise ProviderConfigurationError(
+            "Injected HTTP client 'post' method has been modified or overridden, "
+            "violating trusted client boundaries."
         )
 
     # 1. Environment proxy leakage check

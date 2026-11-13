@@ -1269,4 +1269,74 @@ async def test_ollama_provider_simulated_redirect_fails_closed_without_forwardin
     assert "evil.remote.corp" not in recorded_requests[0]
 
 
+def test_validate_injected_client_custom_client_with_fake_transport_rejected() -> None:
+    class FakeDirectClient:
+        def __init__(self) -> None:
+            self._transport = httpx.MockTransport(lambda req: httpx.Response(200))
+            self.trust_env = False
+            self.follow_redirects = False
+            self._mounts: dict[str, object] = {}
+
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="must be an exact httpx.AsyncClient instance",
+    ):
+        validate_injected_client_for_local_endpoint(FakeDirectClient())
+
+
+def test_validate_injected_client_async_client_subclass_rejected() -> None:
+    class SubclassedAsyncClient(httpx.AsyncClient):
+        async def post(self, *args: object, **kwargs: object) -> httpx.Response:
+            return httpx.Response(200)
+
+    client = SubclassedAsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200)),
+        trust_env=False,
+    )
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="must be an exact httpx.AsyncClient instance",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
+
+def test_validate_injected_client_instance_level_post_override_rejected() -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200)),
+        trust_env=False,
+    )
+    client.__dict__["post"] = lambda *args, **kwargs: None
+
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="overridden 'post' method",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
+
+@pytest.mark.anyio
+async def test_ollama_provider_rejects_subclassed_async_client() -> None:
+    class SubclassedAsyncClient(httpx.AsyncClient):
+        pass
+
+    client = SubclassedAsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200)),
+        trust_env=False,
+    )
+    provider = OllamaProvider(
+        settings=Settings(
+            OLLAMA_BASE_URL="http://127.0.0.1:11434",
+            OLLAMA_MODEL="small-model",
+        ),
+        http_client=client,
+    )
+
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="must be an exact httpx.AsyncClient instance",
+    ):
+        await provider.generate([ChatMessage(role="user", content="hello")])
+
+
+
 
