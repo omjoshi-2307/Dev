@@ -95,6 +95,39 @@ In this stage, `AUTO` complexity does not invoke an AI classifier or dynamic heu
 
 Client metadata (`ChatRequest.metadata`) is untrusted and cannot override system instructions, security boundaries, or authoritative routing decisions.
 
+## Provider Adapters and Platform Integration
+
+DEV interfaces with AI models via standardized provider adapters that satisfy the `AIProvider` protocol (`backend/app/providers/base.py`).
+
+### OpenAI Responses API Adapter (`OpenAIProvider`)
+
+Cloud text generation is implemented in `backend/app/providers/openai_provider.py` targeting the OpenAI Responses API (`/v1/responses`).
+
+#### Implementation Rationale & Windows Code Integrity
+
+The adapter uses `httpx` directly rather than invoking the official `openai` Python SDK client.
+- **Root Cause & Platform Constraint:** Under Windows systems with active Windows Defender Application Control (WDAC) or Smart App Control signing policies (e.g., policy `0283ac0f-fff1-49ae-ada1-8a933130cad6`), dynamic native libraries (`.pyd` files) within user directories are blocked by Code Integrity (Event ID 3077/3033). The official `openai` SDK imports `jiter` (`jiter.cp315-win_amd64.pyd`), a compiled Rust JSON accelerator with no pure-Python fallback. This caused an unconditional `ImportError: DLL load failed while importing jiter` on Windows.
+- **Architectural Alignment:** DEV's `OllamaProvider` already relies on `httpx` for asynchronous HTTP communication. Implementing `OpenAIProvider` with `httpx` establishes design uniformity across all provider adapters, operates purely in Python without binary extensions, and avoids weakening host operating system security controls.
+
+#### Protocol & Schema Mapping
+
+- **Endpoint:** `https://api.openai.com/v1/responses` (POST).
+- **Role Translation:** The Responses API specifies the `developer` role rather than the legacy `system` role. `OpenAIProvider` automatically translates incoming `ChatMessage(role="system", ...)` to `{"role": "developer", ...}` in the payload.
+- **Output Parsing:** The Responses API returns an `output` array of message objects containing content elements of type `output_text`. `OpenAIProvider.extract_output_text` reconstructs the concatenated text from all text parts while also supporting direct top-level `output_text` payloads for test and mock compatibility.
+
+#### Error Handling and Credential Protection
+
+- **Credential Safety:** Server-side `OPENAI_API_KEY` is loaded securely via Pydantic `Settings`. Sensitive credentials are never exposed in log outputs, exception traces, or client-facing errors.
+- **Authentication Failures (HTTP 401):** Mapped to `ProviderConfigurationError` with a sanitized message to prevent leaking partial API keys or token fragments.
+- **Rate Limits & Quotas (HTTP 429):** Mapped to `RuntimeError` detailing quota or rate-limit exhaustion.
+- **Server Errors (HTTP 5xx):** Mapped to `RuntimeError` with HTTP status code and upstream diagnostic message.
+- **Timeouts & Network Faults:** Mapped to standard Python `TimeoutError` (`httpx.TimeoutException`) and `ConnectionError` (`httpx.RequestError`).
+- **Malformed Outputs:** Non-JSON responses or empty/whitespace-only output payloads raise `ValueError`.
+
+### Ollama Local Adapter (`OllamaProvider`)
+
+Local model inference is implemented in `backend/app/providers/ollama_provider.py` communicating with the Ollama server at `OLLAMA_BASE_URL` (defaulting to `http://127.0.0.1:11434/api/chat`). All local requests are strictly non-streaming and execute within the local network perimeter.
+
 ## Memory boundaries
 
 Keep these concepts separate:
