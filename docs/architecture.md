@@ -121,10 +121,10 @@ The adapter uses `httpx` directly rather than invoking the official `openai` Pyt
 - **Authentication Failures (HTTP 401):** Mapped to `ProviderConfigurationError` with a fixed sanitized message (`OpenAI authentication failed: Invalid or unauthorized API key.`) to prevent leaking partial API keys or token fragments.
 - **Rate Limits & Quotas (HTTP 429):** Transient rate limits are retried up to two times, honoring a valid bounded `Retry-After` value or using exponential backoff. Permanent quota/billing failures (for example, `insufficient_quota`) are not retried. Final errors use fixed descriptions and never include upstream message text.
 - **Server Errors (HTTP 5xx):** Retried up to two times with bounded exponential backoff, then mapped to `RuntimeError` preserving the HTTP status code (e.g., `OpenAI service error (500): Upstream server error.`) while concealing response bodies, stack traces, and internal diagnostics.
-- **Timeouts & Network Faults:** Transient timeout and request failures receive at most two retries. Exhausted timeouts map to Python `TimeoutError`; exhausted request failures map to `ConnectionError`. Exception strings do not expose raw transport details.
+- **Timeouts & Network Faults:** Transient timeout and request failures receive at most two retries by default. Exhausted timeouts map to Python `TimeoutError`; exhausted request failures map to `ConnectionError`. Transport exception chaining is suppressed so traceback logging does not reveal underlying transport diagnostics.
 - **Malformed Outputs:** Non-JSON responses or empty/whitespace-only output payloads raise `ValueError`.
 - **Constructor Compatibility:** The original second positional `client` argument remains reserved for legacy SDK-style clients. The HTTPX client is supplied by the keyword-only `http_client` parameter.
-- **Retry Bounds:** The default is two retries (three total attempts) for connection/timeout failures, transient HTTP 429 responses, and HTTP 5xx responses. Permanent quota failures are not retried; all retry delays are bounded.
+- **Retry Bounds:** The default is two retries (three total attempts) for connection/timeout failures, transient HTTP 429 responses, and HTTP 5xx responses. Explicit configuration is limited to at most five retries; timeout and backoff values must be finite and valid. Permanent quota failures are not retried; all retry delays are bounded.
 
 ### Ollama Local Adapter (`OllamaProvider`)
 
