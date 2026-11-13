@@ -55,18 +55,100 @@ def is_loopback_url(url: str | None) -> bool:
 
 
 def validate_injected_client_for_local_endpoint(client: Any) -> None:
-    """Ensure an injected HTTP client does not route local traffic through proxies."""
-    if hasattr(client, "_mounts") and bool(client._mounts):
+    """Ensure an injected HTTP client does not route local traffic through proxies or unsafe transports.
+
+    For local loopback endpoints (such as local Ollama instances under LOCAL_ONLY),
+    all network traffic must be direct to prevent private message leakage.
+
+    Inspection details and compatibility implications:
+    - HTTPX encapsulates request routing in internal transports (`client._transport`)
+      and optional mounted route dispatchers (`client._mounts`).
+    - Standard direct async HTTPX clients use `httpx.AsyncHTTPTransport` backed by an
+      `httpcore.AsyncConnectionPool` (or connection pool without proxy attributes).
+    - Proxy-configured transports in HTTPX replace this pool with `httpcore.AsyncHTTPProxy`
+      or `httpcore.AsyncSOCKSProxy`, or set proxy URL metadata on the transport/pool.
+    - Test transports such as `httpx.MockTransport` and `httpx.ASGITransport` execute in-memory
+      and do not perform remote routing; these are verified as safe.
+    - Custom, unknown, or unverifiable transports whose routing cannot be established as
+      strictly direct and local are rejected to fail closed against potential data exfiltration.
+    - While checking `_transport`, `_pool`, and `_mounts` relies on HTTPX/httpcore internal
+      conventions, these checks are documented and validated against HTTPX's public and
+      internal architectures.
+    """
+    if client is None:
+        return
+
+    # Injected client must be an httpx.AsyncClient or provide a verifiable async transport
+    if not hasattr(client, "_transport"):
         raise ProviderConfigurationError(
-            "Injected HTTP client for local Ollama provider has proxy transports configured, "
-            "violating local destination boundaries."
+            "Injected HTTP client for local Ollama provider is not a valid or verifiable HTTPX client."
         )
 
+    # 1. Environment proxy leakage check
     if getattr(client, "trust_env", False) and any(k in os.environ for k in PROXY_ENV_VARS):
         raise ProviderConfigurationError(
             "Injected HTTP client for local Ollama provider has trust_env=True while proxy "
             "environment variables are active, risking proxy leakage."
         )
+
+    # 2. Proxy mounts check
+    if hasattr(client, "_mounts") and bool(client._mounts):
+        raise ProviderConfigurationError(
+            "Injected HTTP client for local Ollama provider has proxy mounts configured, "
+            "violating local destination boundaries."
+        )
+
+    # 3. Transport inspection
+    transport = getattr(client, "_transport", None)
+    if transport is None:
+        raise ProviderConfigurationError(
+            "Injected HTTP client has no transport configured."
+        )
+
+    # In-memory test transports with verified direct execution
+    if isinstance(transport, (httpx.MockTransport, httpx.ASGITransport)):
+        return
+
+    # Direct async HTTP transport check
+    if isinstance(transport, httpx.AsyncHTTPTransport):
+        pool = getattr(transport, "_pool", None)
+        if pool is None:
+            raise ProviderConfigurationError(
+                "Injected HTTP client transport pool is uninitialized or missing."
+            )
+
+        pool_cls_name = pool.__class__.__name__
+        if "proxy" in pool_cls_name.lower() or hasattr(pool, "_proxy_url"):
+            raise ProviderConfigurationError(
+                "Injected HTTP client for local Ollama provider has an explicit proxy transport "
+                "configured, violating local destination boundaries."
+            )
+
+        # Check against httpcore pool types if available
+        try:
+            import httpcore
+            if isinstance(pool, (httpcore.AsyncHTTPProxy, httpcore.AsyncSOCKSProxy)):
+                raise ProviderConfigurationError(
+                    "Injected HTTP client for local Ollama provider has an explicit proxy transport "
+                    "configured, violating local destination boundaries."
+                )
+            if isinstance(pool, httpcore.AsyncConnectionPool):
+                return
+        except ImportError:
+            pass
+
+        if pool_cls_name == "AsyncConnectionPool" and not hasattr(pool, "_proxy_url"):
+            return
+
+        raise ProviderConfigurationError(
+            f"Injected HTTP client transport pool '{pool_cls_name}' cannot be verified as direct."
+        )
+
+    # Any custom or unknown transport class cannot be established as direct
+    raise ProviderConfigurationError(
+        f"Injected HTTP client uses custom or unverifiable transport '{transport.__class__.__name__}', "
+        "whose routing behavior cannot be established as direct and safe."
+    )
 
 
 class OllamaProvider:

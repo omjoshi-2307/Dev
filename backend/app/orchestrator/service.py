@@ -112,16 +112,24 @@ def validate_provider_identity(
     """Validate that an injected or resolved provider matches its registered routing key.
 
     Prevents dependency-injection bypasses such as executing an OpenAIProvider
-    under the OLLAMA key.
+    under the OLLAMA key, or injecting providers with missing, malformed, or
+    mismatched identity information.
     """
+    name = getattr(provider, "name", None)
+    if not isinstance(name, str) or not name.strip():
+        raise RoutingPolicyError(
+            "Provider identity unverifiable: provider is missing a valid 'name' attribute."
+        )
+
+    norm_name = name.strip().lower()
+
     if expected_key == ProviderName.OLLAMA:
         if isinstance(provider, OpenAIProvider):
             raise RoutingPolicyError(
                 "Provider identity mismatch: OpenAIProvider cannot be registered or "
                 "executed under provider key 'ollama'."
             )
-        name = getattr(provider, "name", None)
-        if isinstance(name, str) and name.lower() != "ollama":
+        if norm_name != "ollama":
             raise RoutingPolicyError(
                 f"Provider identity mismatch: provider with name '{name}' cannot be "
                 "registered or executed under provider key 'ollama'."
@@ -132,8 +140,7 @@ def validate_provider_identity(
                 "Provider identity mismatch: OllamaProvider cannot be registered or "
                 "executed under provider key 'openai'."
             )
-        name = getattr(provider, "name", None)
-        if isinstance(name, str) and name.lower() != "openai":
+        if norm_name != "openai":
             raise RoutingPolicyError(
                 f"Provider identity mismatch: provider with name '{name}' cannot be "
                 "registered or executed under provider key 'openai'."
@@ -191,15 +198,22 @@ class ChatOrchestrator:
     def _resolve_provider_endpoint(
         self,
         provider_name: ConcreteProvider | ProviderName,
+        *,
+        provider: AIProvider | None = None,
     ) -> str | None:
-        """Resolve the configured target endpoint URL for a provider."""
+        """Resolve the configured target endpoint URL for a provider.
+
+        For injected providers, resolves the endpoint directly from the provider's
+        own configuration (base_url). Never infers or defaults an injected provider's
+        target destination from unrelated orchestrator settings.
+        """
         if provider_name == ProviderName.OLLAMA:
-            if ProviderName.OLLAMA in self._providers:
-                prov = self._providers[ProviderName.OLLAMA]
-                if hasattr(prov, "base_url") and isinstance(prov.base_url, str):
-                    return prov.base_url
-                if hasattr(prov, "_settings") and hasattr(prov._settings, "ollama_base_url"):
-                    return prov._settings.ollama_base_url
+            target_prov = provider or self._providers.get(ProviderName.OLLAMA)
+            if target_prov is not None:
+                if hasattr(target_prov, "base_url") and isinstance(target_prov.base_url, str) and target_prov.base_url.strip():
+                    return target_prov.base_url.strip()
+                # An injected provider without a verified base_url cannot be verified
+                return None
             return getattr(self._settings, "ollama_base_url", None)
         return None
 
@@ -244,14 +258,18 @@ class ChatOrchestrator:
                     f"cannot execute provider '{decision.selected_provider}'."
                 )
 
-            # Ensure provider is strictly local (defense-in-depth)
-            if isinstance(provider, OpenAIProvider) or getattr(provider, "name", "").lower() != "ollama":
+            # Ensure provider is strictly a verified OllamaProvider adapter
+            # A matching .name string alone does not establish safety; custom/fake providers are rejected
+            if not isinstance(provider, OllamaProvider):
                 raise RoutingPolicyError(
-                    "Privacy boundary violation: non-local provider cannot execute under LOCAL_ONLY."
+                    f"Privacy boundary violation: LOCAL_ONLY requests require a verified "
+                    f"OllamaProvider adapter; custom or unverifiable provider "
+                    f"'{provider.__class__.__name__}' is rejected."
                 )
 
             # Enforce that LOCAL_ONLY destination is strictly a verified local loopback endpoint
-            endpoint = self._resolve_provider_endpoint(decision.selected_provider)
+            # Resolved directly from the provider itself (never inferred from unrelated orchestrator settings)
+            endpoint = self._resolve_provider_endpoint(decision.selected_provider, provider=provider)
             validate_local_destination(endpoint)
 
             # Enforce that injected provider transports do not have proxy mounts or active proxy leakage

@@ -13,6 +13,7 @@ from backend.app.providers.base import (
     ProviderConfigurationError,
     ProviderResponse,
 )
+from backend.app.providers.ollama_provider import OllamaProvider
 from backend.app.router.enums import PrivacyLevel, ProviderName, TaskComplexity
 from backend.app.router.policy import RoutingPolicyError
 from backend.app.router.schemas import (
@@ -58,6 +59,46 @@ class MockProvider:
         )
 
 
+def make_mock_ollama_provider(
+    settings: Settings,
+    response_content: str = "Local Ollama generated response.",
+    response_model: str = "llama3.2:latest",
+    error_to_raise: Exception | None = None,
+    raw_response: Any = None,
+    status_code: int = 200,
+) -> tuple[OllamaProvider, list[dict[str, Any]]]:
+    """Create a real OllamaProvider backed by a controlled in-memory MockTransport."""
+    recorded_requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        body = json.loads(request.content.decode("utf-8")) if request.content else {}
+        recorded_requests.append({"url": str(request.url), "json": body})
+
+        if error_to_raise is not None:
+            raise error_to_raise
+
+        if raw_response is not None:
+            return httpx.Response(status_code, json=raw_response, request=request)
+
+        return httpx.Response(
+            status_code,
+            json={
+                "message": {"role": "assistant", "content": response_content},
+                "model": response_model,
+            },
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        trust_env=False,
+    )
+    provider = OllamaProvider(settings=settings, http_client=client)
+    return provider, recorded_requests
+
+
 @pytest.fixture
 def both_configured_settings() -> Settings:
     return Settings(
@@ -99,8 +140,8 @@ def none_configured_settings() -> Settings:
 # ---------------------------------------------------------------------------
 @pytest.mark.anyio
 async def test_successful_ollama_execution(both_configured_settings: Settings) -> None:
-    ollama_mock = MockProvider(
-        name="ollama",
+    ollama_provider, recorded = make_mock_ollama_provider(
+        both_configured_settings,
         response_content="Local Ollama generated response.",
         response_model="llama3.2:latest",
     )
@@ -108,7 +149,7 @@ async def test_successful_ollama_execution(both_configured_settings: Settings) -
 
     orchestrator = ChatOrchestrator(
         settings=both_configured_settings,
-        ollama_provider=ollama_mock,
+        ollama_provider=ollama_provider,
         openai_provider=openai_mock,
     )
 
@@ -124,7 +165,7 @@ async def test_successful_ollama_execution(both_configured_settings: Settings) -
     assert response.provider == ProviderName.OLLAMA
     assert response.model == "llama3.2:latest"
     assert response.routing.selected_provider == ProviderName.OLLAMA
-    assert ollama_mock.call_count == 1
+    assert len(recorded) == 1
     assert openai_mock.call_count == 0
 
 
@@ -133,7 +174,7 @@ async def test_successful_ollama_execution(both_configured_settings: Settings) -
 # ---------------------------------------------------------------------------
 @pytest.mark.anyio
 async def test_successful_openai_execution(both_configured_settings: Settings) -> None:
-    ollama_mock = MockProvider(name="ollama")
+    ollama_provider, recorded = make_mock_ollama_provider(both_configured_settings)
     openai_mock = MockProvider(
         name="openai",
         response_content="OpenAI generated cloud response.",
@@ -142,7 +183,7 @@ async def test_successful_openai_execution(both_configured_settings: Settings) -
 
     orchestrator = ChatOrchestrator(
         settings=both_configured_settings,
-        ollama_provider=ollama_mock,
+        ollama_provider=ollama_provider,
         openai_provider=openai_mock,
     )
 
@@ -160,7 +201,7 @@ async def test_successful_openai_execution(both_configured_settings: Settings) -
     assert response.model == "gpt-4o-mini"
     assert response.routing.selected_provider == ProviderName.OPENAI
     assert openai_mock.call_count == 1
-    assert ollama_mock.call_count == 0
+    assert len(recorded) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -170,10 +211,10 @@ async def test_successful_openai_execution(both_configured_settings: Settings) -
 async def test_correct_message_conversion_and_ordering(
     both_configured_settings: Settings,
 ) -> None:
-    ollama_mock = MockProvider(name="ollama")
+    ollama_provider, recorded = make_mock_ollama_provider(both_configured_settings)
     orchestrator = ChatOrchestrator(
         settings=both_configured_settings,
-        ollama_provider=ollama_mock,
+        ollama_provider=ollama_provider,
     )
 
     input_messages = [
@@ -189,13 +230,12 @@ async def test_correct_message_conversion_and_ordering(
 
     await orchestrator.handle_chat_request(request)
 
-    assert ollama_mock.call_count == 1
-    recorded = ollama_mock.recorded_messages[0]
-    assert len(recorded) == 3
-    for orig, conv in zip(input_messages, recorded, strict=True):
-        assert isinstance(conv, ChatMessage)
-        assert conv.role == orig.role
-        assert conv.content == orig.content
+    assert len(recorded) == 1
+    payload_messages = recorded[0]["json"]["messages"]
+    assert len(payload_messages) == 3
+    for orig, conv in zip(input_messages, payload_messages, strict=True):
+        assert conv["role"] == orig.role
+        assert conv["content"] == orig.content
 
 
 def test_convert_messages_direct_helper() -> None:
@@ -260,14 +300,14 @@ async def test_correct_routing_decision_preservation(
 async def test_correct_normalized_response_fields(
     both_configured_settings: Settings,
 ) -> None:
-    ollama_mock = MockProvider(
-        name="ollama",
+    ollama_provider, recorded = make_mock_ollama_provider(
+        both_configured_settings,
         response_content="Detailed normalized answer.",
         response_model="llama3.2:latest",
     )
     orchestrator = ChatOrchestrator(
         settings=both_configured_settings,
-        ollama_provider=ollama_mock,
+        ollama_provider=ollama_provider,
     )
 
     request = ChatRequest(
@@ -284,6 +324,7 @@ async def test_correct_normalized_response_fields(
     assert isinstance(response.routing, RoutingDecision)
     assert response.metadata["client_session_id"] == "session-12345"
     assert response.metadata["trace_id"] == "xyz-789"
+    assert len(recorded) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -346,12 +387,14 @@ async def test_explicit_provider_selection_openai(
 async def test_local_only_never_invokes_openai(
     both_configured_settings: Settings,
 ) -> None:
-    ollama_mock = MockProvider(name="ollama", response_content="Local reply")
+    ollama_provider, recorded = make_mock_ollama_provider(
+        both_configured_settings, response_content="Local reply"
+    )
     openai_mock = MockProvider(name="openai", response_content="Cloud reply")
 
     orchestrator = ChatOrchestrator(
         settings=both_configured_settings,
-        ollama_provider=ollama_mock,
+        ollama_provider=ollama_provider,
         openai_provider=openai_mock,
     )
 
@@ -364,7 +407,7 @@ async def test_local_only_never_invokes_openai(
     resp = await orchestrator.handle_chat_request(request_complex)
     assert resp.provider == ProviderName.OLLAMA
     assert openai_mock.call_count == 0
-    assert ollama_mock.call_count == 1
+    assert len(recorded) == 1
 
     # 2. Explicit request for OpenAI under LOCAL_ONLY must be rejected
     request_explicit_cloud = ChatRequest(
@@ -443,15 +486,15 @@ async def test_routing_policy_failure_prevents_provider_execution(
 async def test_ollama_runtime_failure_does_not_invoke_openai(
     both_configured_settings: Settings,
 ) -> None:
-    ollama_mock = MockProvider(
-        name="ollama",
+    ollama_provider, recorded = make_mock_ollama_provider(
+        both_configured_settings,
         error_to_raise=RuntimeError("Ollama daemon unreachable or crashed"),
     )
     openai_mock = MockProvider(name="openai", response_content="OpenAI should not run")
 
     orchestrator = ChatOrchestrator(
         settings=both_configured_settings,
-        ollama_provider=ollama_mock,
+        ollama_provider=ollama_provider,
         openai_provider=openai_mock,
     )
 
@@ -463,7 +506,7 @@ async def test_ollama_runtime_failure_does_not_invoke_openai(
     with pytest.raises(RuntimeError, match="Ollama daemon unreachable"):
         await orchestrator.handle_chat_request(request)
 
-    assert ollama_mock.call_count == 1
+    assert len(recorded) == 1
     # OpenAI must NEVER be invoked as an automatic runtime fallback
     assert openai_mock.call_count == 0
 
@@ -476,11 +519,13 @@ async def test_openai_runtime_failure_does_not_invoke_ollama(
         name="openai",
         error_to_raise=RuntimeError("OpenAI API connection failed"),
     )
-    ollama_mock = MockProvider(name="ollama", response_content="Ollama should not run")
+    ollama_provider, recorded = make_mock_ollama_provider(
+        both_configured_settings, response_content="Ollama should not run"
+    )
 
     orchestrator = ChatOrchestrator(
         settings=both_configured_settings,
-        ollama_provider=ollama_mock,
+        ollama_provider=ollama_provider,
         openai_provider=openai_mock,
     )
 
@@ -495,7 +540,7 @@ async def test_openai_runtime_failure_does_not_invoke_ollama(
 
     assert openai_mock.call_count == 1
     # Ollama must NEVER be invoked on OpenAI failure
-    assert ollama_mock.call_count == 0
+    assert len(recorded) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -505,17 +550,20 @@ async def test_openai_runtime_failure_does_not_invoke_ollama(
 async def test_provider_identity_mismatch_handled_safely(
     both_configured_settings: Settings,
 ) -> None:
-    # The provider erroneously returns a different identity or model
-    ollama_mock = MockProvider(
-        name="ollama",
-        response_content="Model response",
-        response_provider="untrusted-vendor",
-        response_model="alien-model-v99",
-    )
+    # A real OllamaProvider subclass returning mismatched response metadata
+    class MismatchedOllamaProvider(OllamaProvider):
+        async def generate(self, messages: Sequence[ChatMessage]) -> ProviderResponse:
+            return ProviderResponse(
+                content="Model response",
+                provider="untrusted-vendor",
+                model="alien-model-v99",
+            )
+
+    ollama_mismatch = MismatchedOllamaProvider(settings=both_configured_settings)
 
     orchestrator = ChatOrchestrator(
         settings=both_configured_settings,
-        ollama_provider=ollama_mock,
+        ollama_provider=ollama_mismatch,
     )
 
     request = ChatRequest(
@@ -551,13 +599,13 @@ async def test_empty_or_whitespace_provider_output(
     both_configured_settings: Settings,
     bad_content: str,
 ) -> None:
-    ollama_mock = MockProvider(
-        name="ollama",
+    ollama_provider, _ = make_mock_ollama_provider(
+        both_configured_settings,
         response_content=bad_content,
     )
     orchestrator = ChatOrchestrator(
         settings=both_configured_settings,
-        ollama_provider=ollama_mock,
+        ollama_provider=ollama_provider,
     )
 
     request = ChatRequest(
@@ -573,13 +621,14 @@ async def test_empty_or_whitespace_provider_output(
 async def test_invalid_provider_response_type(
     both_configured_settings: Settings,
 ) -> None:
-    ollama_mock = MockProvider(
-        name="ollama",
-        raw_response={"not": "a ProviderResponse"},
-    )
+    class BadReturnOllama(OllamaProvider):
+        async def generate(self, messages: Sequence[ChatMessage]) -> Any:
+            return {"not": "a ProviderResponse"}
+
+    ollama_bad = BadReturnOllama(settings=both_configured_settings)
     orchestrator = ChatOrchestrator(
         settings=both_configured_settings,
-        ollama_provider=ollama_mock,
+        ollama_provider=ollama_bad,
     )
 
     request = ChatRequest(
@@ -598,22 +647,22 @@ async def test_invalid_provider_response_type(
 async def test_provider_injection_without_live_network(
     none_configured_settings: Settings,
 ) -> None:
-    # Even when settings are completely blank/empty, injected mocks execute in-memory
-    ollama_mock = MockProvider(
-        name="ollama",
-        response_content="In-memory test pass",
-        response_model="custom-mock-model",
-    )
-
+    # Injected OllamaProvider with safe MockTransport executes in-memory
     custom_settings = Settings(
         OPENAI_API_KEY=None,
         OPENAI_MODEL=None,
         OLLAMA_MODEL="custom-mock-model",
+        OLLAMA_BASE_URL="http://127.0.0.1:11434",
+    )
+    ollama_provider, recorded = make_mock_ollama_provider(
+        custom_settings,
+        response_content="In-memory test pass",
+        response_model="custom-mock-model",
     )
 
     orchestrator = ChatOrchestrator(
         settings=custom_settings,
-        providers={ProviderName.OLLAMA: ollama_mock},
+        providers={ProviderName.OLLAMA: ollama_provider},
     )
 
     request = ChatRequest(
@@ -625,7 +674,7 @@ async def test_provider_injection_without_live_network(
     assert response.content == "In-memory test pass"
     assert response.provider == ProviderName.OLLAMA
     assert response.model == "custom-mock-model"
-    assert ollama_mock.call_count == 1
+    assert len(recorded) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -633,10 +682,12 @@ async def test_provider_injection_without_live_network(
 # ---------------------------------------------------------------------------
 @pytest.mark.anyio
 async def test_orchestrator_alias_method(both_configured_settings: Settings) -> None:
-    ollama_mock = MockProvider(name="ollama", response_content="Alias test")
+    ollama_provider, recorded = make_mock_ollama_provider(
+        both_configured_settings, response_content="Alias test"
+    )
     orchestrator = ChatOrchestrator(
         settings=both_configured_settings,
-        ollama_provider=ollama_mock,
+        ollama_provider=ollama_provider,
     )
 
     request = ChatRequest(
@@ -646,7 +697,7 @@ async def test_orchestrator_alias_method(both_configured_settings: Settings) -> 
 
     response = await orchestrator.orchestrate(request)
     assert response.content == "Alias test"
-    assert ollama_mock.call_count == 1
+    assert len(recorded) == 1
 
 
 def test_lazy_provider_resolution() -> None:
@@ -677,10 +728,12 @@ def test_lazy_provider_resolution() -> None:
 async def test_local_only_default_local_endpoint_accepted(
     both_configured_settings: Settings,
 ) -> None:
-    ollama_mock = MockProvider(name="ollama", response_content="OK")
+    ollama_provider, recorded = make_mock_ollama_provider(
+        both_configured_settings, response_content="OK"
+    )
     orchestrator = ChatOrchestrator(
         settings=both_configured_settings,
-        ollama_provider=ollama_mock,
+        ollama_provider=ollama_provider,
     )
 
     request = ChatRequest(
@@ -690,7 +743,7 @@ async def test_local_only_default_local_endpoint_accepted(
 
     resp = await orchestrator.handle_chat_request(request)
     assert resp.content == "OK"
-    assert ollama_mock.call_count == 1
+    assert len(recorded) == 1
 
 
 @pytest.mark.anyio
@@ -716,10 +769,12 @@ async def test_local_only_accepted_loopback_destinations(
         OLLAMA_MODEL="llama3.2:latest",
         OLLAMA_BASE_URL=valid_local_url,
     )
-    ollama_mock = MockProvider(name="ollama", response_content="Loopback OK")
+    ollama_provider, recorded = make_mock_ollama_provider(
+        settings, response_content="Loopback OK"
+    )
     orchestrator = ChatOrchestrator(
         settings=settings,
-        ollama_provider=ollama_mock,
+        ollama_provider=ollama_provider,
     )
 
     request = ChatRequest(
@@ -729,7 +784,7 @@ async def test_local_only_accepted_loopback_destinations(
 
     resp = await orchestrator.handle_chat_request(request)
     assert resp.content == "Loopback OK"
-    assert ollama_mock.call_count == 1
+    assert len(recorded) == 1
 
 
 @pytest.mark.anyio
@@ -758,12 +813,17 @@ async def test_local_only_rejects_remote_and_invalid_destinations(
         OLLAMA_MODEL="llama3.2:latest",
         OLLAMA_BASE_URL=remote_or_invalid_url if remote_or_invalid_url else "http://127.0.0.1:11434",
     )
-    ollama_mock = MockProvider(name="ollama", response_content="Should not be called")
-    ollama_mock.base_url = remote_or_invalid_url
+    ollama_provider, recorded = make_mock_ollama_provider(
+        settings, response_content="Should not be called"
+    )
+    if remote_or_invalid_url == "":
+        ollama_provider._settings = Settings(
+            OLLAMA_MODEL="llama3.2:latest", OLLAMA_BASE_URL=""
+        )
 
     orchestrator = ChatOrchestrator(
         settings=settings,
-        ollama_provider=ollama_mock,
+        ollama_provider=ollama_provider,
     )
 
     request = ChatRequest(
@@ -775,7 +835,7 @@ async def test_local_only_rejects_remote_and_invalid_destinations(
         await orchestrator.handle_chat_request(request)
 
     # Provider must NEVER be invoked when destination validation fails
-    assert ollama_mock.call_count == 0
+    assert len(recorded) == 0
 
 
 @pytest.mark.anyio
@@ -785,12 +845,13 @@ async def test_cloud_allowed_permits_remote_ollama_destination() -> None:
         OLLAMA_MODEL="llama3.2:latest",
         OLLAMA_BASE_URL=remote_url,
     )
-    ollama_mock = MockProvider(name="ollama", response_content="Remote Ollama OK")
-    ollama_mock.base_url = remote_url
+    ollama_provider, recorded = make_mock_ollama_provider(
+        settings, response_content="Remote Ollama OK"
+    )
 
     orchestrator = ChatOrchestrator(
         settings=settings,
-        ollama_provider=ollama_mock,
+        ollama_provider=ollama_provider,
     )
 
     request = ChatRequest(
@@ -801,7 +862,7 @@ async def test_cloud_allowed_permits_remote_ollama_destination() -> None:
 
     resp = await orchestrator.handle_chat_request(request)
     assert resp.content == "Remote Ollama OK"
-    assert ollama_mock.call_count == 1
+    assert len(recorded) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -834,15 +895,18 @@ def test_client_metadata_rejects_orchestrator_diagnostic_keys(
 async def test_normal_metadata_pass_through_and_diagnostic_integrity(
     both_configured_settings: Settings,
 ) -> None:
-    ollama_mock = MockProvider(
-        name="ollama",
-        response_content="Response",
-        response_provider="mismatched_provider_name",
-        response_model="mismatched_model_name",
-    )
+    class MismatchedMetadataOllama(OllamaProvider):
+        async def generate(self, messages: Sequence[ChatMessage]) -> ProviderResponse:
+            return ProviderResponse(
+                content="Response",
+                provider="mismatched_provider_name",
+                model="mismatched_model_name",
+            )
+
+    ollama = MismatchedMetadataOllama(settings=both_configured_settings)
     orchestrator = ChatOrchestrator(
         settings=both_configured_settings,
-        ollama_provider=ollama_mock,
+        ollama_provider=ollama,
     )
 
     request = ChatRequest(
@@ -1018,3 +1082,178 @@ async def test_remote_ollama_with_cloud_allowed_retains_proxy_compatibility() ->
     prov = orchestrator._get_provider(ProviderName.OLLAMA)
     assert isinstance(prov, OllamaProvider)
     assert prov._trust_env is None
+
+
+# ---------------------------------------------------------------------------
+# Privacy Boundary & LOCAL_ONLY Security Hardening Tests
+# ---------------------------------------------------------------------------
+def test_validate_provider_identity_rejects_missing_or_empty_name() -> None:
+    from backend.app.orchestrator.service import validate_provider_identity
+
+    class NamelessProvider:
+        pass
+
+    class EmptyNameProvider:
+        name = "   "
+
+    with pytest.raises(RoutingPolicyError, match="missing a valid 'name' attribute"):
+        validate_provider_identity(ProviderName.OLLAMA, NamelessProvider())
+
+    with pytest.raises(RoutingPolicyError, match="missing a valid 'name' attribute"):
+        validate_provider_identity(ProviderName.OPENAI, EmptyNameProvider())
+
+
+@pytest.mark.anyio
+async def test_proxy_configured_injected_transport_cannot_receive_local_only_prompts(
+    both_configured_settings: Settings,
+) -> None:
+    proxy_transport = httpx.AsyncHTTPTransport(
+        proxy="http://proxy.leak.corp:8080"
+    )
+    proxy_client = httpx.AsyncClient(transport=proxy_transport, trust_env=False)
+    ollama = OllamaProvider(
+        settings=both_configured_settings,
+        http_client=proxy_client,
+    )
+    orchestrator = ChatOrchestrator(
+        settings=both_configured_settings,
+        ollama_provider=ollama,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Top secret local info")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+    )
+
+    with pytest.raises(ProviderConfigurationError, match="explicit proxy transport configured"):
+        await orchestrator.handle_chat_request(request)
+
+
+@pytest.mark.anyio
+async def test_unverifiable_injected_transport_rejected_before_execution(
+    both_configured_settings: Settings,
+) -> None:
+    class CustomUnverifiableTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(
+            self, request: httpx.Request
+        ) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"message": {"role": "assistant", "content": "exfiltrated"}},
+            )
+
+    unverifiable_client = httpx.AsyncClient(
+        transport=CustomUnverifiableTransport(),
+        trust_env=False,
+    )
+    ollama = OllamaProvider(
+        settings=both_configured_settings,
+        http_client=unverifiable_client,
+    )
+    orchestrator = ChatOrchestrator(
+        settings=both_configured_settings,
+        ollama_provider=ollama,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Top secret local info")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+    )
+
+    with pytest.raises(ProviderConfigurationError, match="custom or unverifiable transport"):
+        await orchestrator.handle_chat_request(request)
+
+
+@pytest.mark.anyio
+async def test_custom_provider_impersonating_ollama_cannot_execute_local_only(
+    both_configured_settings: Settings,
+) -> None:
+    class FakeOllamaProvider:
+        name = "ollama"
+        base_url = "http://localhost:11434"
+
+        async def generate(self, messages: Sequence[ChatMessage]) -> ProviderResponse:
+            return ProviderResponse(
+                content="exfiltrated data",
+                provider="ollama",
+                model="llama3.2:latest",
+            )
+
+    # Impersonator passes __init__ key validation because name == "ollama",
+    # but MUST be rejected at execution for LOCAL_ONLY requests
+    fake_ollama = FakeOllamaProvider()
+    orchestrator = ChatOrchestrator(
+        settings=both_configured_settings,
+        ollama_provider=fake_ollama,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Top secret local info")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+    )
+
+    with pytest.raises(
+        RoutingPolicyError,
+        match="LOCAL_ONLY requests require a verified OllamaProvider adapter",
+    ):
+        await orchestrator.handle_chat_request(request)
+
+
+@pytest.mark.anyio
+async def test_injected_provider_own_endpoint_validated_not_orchestrator_settings() -> None:
+    # Orchestrator settings specify a safe local endpoint,
+    # but the injected OllamaProvider is configured to target a remote server.
+    orchestrator_settings = Settings(
+        OLLAMA_BASE_URL="http://localhost:11434",
+        OLLAMA_MODEL="llama3.2:latest",
+    )
+    remote_provider_settings = Settings(
+        OLLAMA_BASE_URL="http://remote.hostile.internal:11434",
+        OLLAMA_MODEL="llama3.2:latest",
+    )
+    remote_ollama = OllamaProvider(settings=remote_provider_settings)
+    orchestrator = ChatOrchestrator(
+        settings=orchestrator_settings,
+        ollama_provider=remote_ollama,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Top secret local info")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+    )
+
+    # Must fail because the injected provider's own base_url is remote,
+    # proving the orchestrator does not infer the endpoint from its own settings.
+    with pytest.raises(
+        RoutingPolicyError,
+        match="LOCAL_ONLY destination boundary violation: host 'remote.hostile.internal'",
+    ):
+        await orchestrator.handle_chat_request(request)
+
+
+@pytest.mark.anyio
+async def test_injected_provider_without_base_url_rejected_for_local_only(
+    both_configured_settings: Settings,
+) -> None:
+    class NoBaseUrlOllama(OllamaProvider):
+        @property
+        def base_url(self) -> Any:
+            return None
+
+    no_url_ollama = NoBaseUrlOllama(settings=both_configured_settings)
+    orchestrator = ChatOrchestrator(
+        settings=both_configured_settings,
+        ollama_provider=no_url_ollama,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Top secret local info")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+    )
+
+    with pytest.raises(
+        RoutingPolicyError,
+        match="LOCAL_ONLY destination boundary violation: local provider endpoint is not configured",
+    ):
+        await orchestrator.handle_chat_request(request)
+

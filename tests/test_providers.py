@@ -10,7 +10,10 @@ import pytest
 
 from backend.app.config import Settings
 from backend.app.providers.base import ChatMessage, ProviderConfigurationError
-from backend.app.providers.ollama_provider import OllamaProvider
+from backend.app.providers.ollama_provider import (
+    OllamaProvider,
+    validate_injected_client_for_local_endpoint,
+)
 from backend.app.providers.openai_provider import (
     DEFAULT_OPENAI_ENDPOINT,
     OpenAIProvider,
@@ -1109,4 +1112,84 @@ async def test_ollama_provider_explicit_trust_env_true_on_loopback_still_disable
     resp = await provider.generate([ChatMessage(role="user", content="hello")])
     assert resp.content == "direct reply"
     assert recorded_kwargs.get("trust_env") is False
+
+
+# ---------------------------------------------------------------------------
+# Injected Transport and Client Hardening Tests for Local Loopback Endpoints
+# ---------------------------------------------------------------------------
+def test_validate_injected_client_explicit_proxy_transport_rejected() -> None:
+    # Explicit proxy transport must be rejected even with trust_env=False
+    proxy_transport = httpx.AsyncHTTPTransport(
+        proxy="http://proxy.corporate.internal:8080"
+    )
+    client = httpx.AsyncClient(transport=proxy_transport, trust_env=False)
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="explicit proxy transport configured",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
+
+def test_validate_injected_client_proxy_mounts_rejected() -> None:
+    client = httpx.AsyncClient(proxy="http://proxy.corporate.internal:8080")
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="proxy mounts configured",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
+
+def test_validate_injected_client_trust_env_true_with_env_vars_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.corporate.internal:8080")
+    client = httpx.AsyncClient(trust_env=True)
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="trust_env=True while proxy environment variables are active",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
+
+def test_validate_injected_client_safe_direct_transports_accepted() -> None:
+    # 1. Standard direct async client
+    direct_client = httpx.AsyncClient(trust_env=False)
+    validate_injected_client_for_local_endpoint(direct_client)
+
+    # 2. In-memory MockTransport
+    mock_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200)),
+        trust_env=False,
+    )
+    validate_injected_client_for_local_endpoint(mock_client)
+
+    # 3. None client passes (defaults handled internally)
+    validate_injected_client_for_local_endpoint(None)
+
+
+def test_validate_injected_client_custom_unverifiable_transport_rejected() -> None:
+    class CustomTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(
+            self, request: httpx.Request
+        ) -> httpx.Response:
+            return httpx.Response(200)
+
+    client = httpx.AsyncClient(transport=CustomTransport(), trust_env=False)
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="custom or unverifiable transport",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
+
+def test_validate_injected_client_non_httpx_client_rejected() -> None:
+    class DummyClient:
+        pass
+
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="not a valid or verifiable HTTPX client",
+    ):
+        validate_injected_client_for_local_endpoint(DummyClient())
+
 
