@@ -242,6 +242,10 @@ def test_client_metadata_rejects_reserved_system_keys() -> None:
         "preferred_provider",
         "routing",
         "allow_fallback",
+        "identity_mismatch",
+        "model_mismatch",
+        "provider_reported_name",
+        "provider_reported_model",
     ]
 
     for key in reserved_keys:

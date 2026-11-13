@@ -667,3 +667,204 @@ def test_lazy_provider_resolution() -> None:
     # Re-accessing returns the cached instance
     assert orchestrator._get_provider(ProviderName.OLLAMA) is ollama
     assert orchestrator._get_provider(ProviderName.OPENAI) is openai
+
+
+# ---------------------------------------------------------------------------
+# Finding 1 Tests: LOCAL_ONLY Destination Boundary Enforcement
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_local_only_default_local_endpoint_accepted(
+    both_configured_settings: Settings,
+) -> None:
+    ollama_mock = MockProvider(name="ollama", response_content="OK")
+    orchestrator = ChatOrchestrator(
+        settings=both_configured_settings,
+        ollama_provider=ollama_mock,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Test")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+    )
+
+    resp = await orchestrator.handle_chat_request(request)
+    assert resp.content == "OK"
+    assert ollama_mock.call_count == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "valid_local_url",
+    [
+        "http://localhost:11434",
+        "http://localhost:11434/",
+        "http://localhost",
+        "http://localhost.",
+        "https://localhost:11434",
+        "http://127.0.0.1:11434",
+        "http://127.0.0.1",
+        "http://127.0.0.2:11434",
+        "http://[::1]:11434",
+        "http://[::1]",
+    ],
+)
+async def test_local_only_accepted_loopback_destinations(
+    valid_local_url: str,
+) -> None:
+    settings = Settings(
+        OLLAMA_MODEL="llama3.2:latest",
+        OLLAMA_BASE_URL=valid_local_url,
+    )
+    ollama_mock = MockProvider(name="ollama", response_content="Loopback OK")
+    orchestrator = ChatOrchestrator(
+        settings=settings,
+        ollama_provider=ollama_mock,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Test loopback")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+    )
+
+    resp = await orchestrator.handle_chat_request(request)
+    assert resp.content == "Loopback OK"
+    assert ollama_mock.call_count == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "remote_or_invalid_url",
+    [
+        "http://remote.host:11434",
+        "http://api.ollama.ai:11434",
+        "http://192.168.1.50:11434",
+        "http://10.0.0.1:11434",
+        "http://8.8.8.8:11434",
+        "http://localhost.evil.com:11434",
+        "http://fake-localhost:11434",
+        "http://notlocalhost:11434",
+        "http://user:pass@127.0.0.1:11434",
+        "ftp://127.0.0.1:11434",
+        "not_a_valid_url",
+        "://invalid",
+        "",
+    ],
+)
+async def test_local_only_rejects_remote_and_invalid_destinations(
+    remote_or_invalid_url: str,
+) -> None:
+    settings = Settings(
+        OLLAMA_MODEL="llama3.2:latest",
+        OLLAMA_BASE_URL=remote_or_invalid_url if remote_or_invalid_url else "http://127.0.0.1:11434",
+    )
+    ollama_mock = MockProvider(name="ollama", response_content="Should not be called")
+    ollama_mock.base_url = remote_or_invalid_url
+
+    orchestrator = ChatOrchestrator(
+        settings=settings,
+        ollama_provider=ollama_mock,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Private content")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+    )
+
+    with pytest.raises(RoutingPolicyError, match="LOCAL_ONLY destination boundary violation"):
+        await orchestrator.handle_chat_request(request)
+
+    # Provider must NEVER be invoked when destination validation fails
+    assert ollama_mock.call_count == 0
+
+
+@pytest.mark.anyio
+async def test_cloud_allowed_permits_remote_ollama_destination() -> None:
+    remote_url = "http://remote-team-ollama.internal:11434"
+    settings = Settings(
+        OLLAMA_MODEL="llama3.2:latest",
+        OLLAMA_BASE_URL=remote_url,
+    )
+    ollama_mock = MockProvider(name="ollama", response_content="Remote Ollama OK")
+    ollama_mock.base_url = remote_url
+
+    orchestrator = ChatOrchestrator(
+        settings=settings,
+        ollama_provider=ollama_mock,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Cloud allowed request")],
+        privacy_level=PrivacyLevel.CLOUD_ALLOWED,
+        preferred_provider=ProviderName.OLLAMA,
+    )
+
+    resp = await orchestrator.handle_chat_request(request)
+    assert resp.content == "Remote Ollama OK"
+    assert ollama_mock.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Finding 2 Tests: Protect Orchestrator-Owned Metadata
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "malicious_key",
+    [
+        "identity_mismatch",
+        "model_mismatch",
+        "provider_reported_name",
+        "provider_reported_model",
+        "IDENTITY_MISMATCH",
+        "Provider_Reported_Name",
+    ],
+)
+def test_client_metadata_rejects_orchestrator_diagnostic_keys(
+    malicious_key: str,
+) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="Client metadata contains reserved system key"):
+        ChatRequest(
+            messages=[ChatMessageInput(role="user", content="Hello")],
+            metadata={malicious_key: True},
+        )
+
+
+@pytest.mark.anyio
+async def test_normal_metadata_pass_through_and_diagnostic_integrity(
+    both_configured_settings: Settings,
+) -> None:
+    ollama_mock = MockProvider(
+        name="ollama",
+        response_content="Response",
+        response_provider="mismatched_provider_name",
+        response_model="mismatched_model_name",
+    )
+    orchestrator = ChatOrchestrator(
+        settings=both_configured_settings,
+        ollama_provider=ollama_mock,
+    )
+
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Hello")],
+        privacy_level=PrivacyLevel.LOCAL_ONLY,
+        metadata={
+            "client_tracking_id": "track-456",
+            "correlation_id": "corr-789",
+        },
+    )
+
+    response = await orchestrator.handle_chat_request(request)
+
+    # Legitimate client metadata is preserved
+    assert response.metadata["client_tracking_id"] == "track-456"
+    assert response.metadata["correlation_id"] == "corr-789"
+
+    # Orchestrator-owned diagnostics are accurately populated
+    assert response.metadata["identity_mismatch"] is True
+    assert response.metadata["model_mismatch"] is True
+    assert response.metadata["provider_reported_name"] == "mismatched_provider_name"
+    assert response.metadata["provider_reported_model"] == "mismatched_model_name"
+
+    # Authoritative provider and model reflect DEV routing, not provider self-reporting
+    assert response.provider == ProviderName.OLLAMA
+    assert response.model == "llama3.2:latest"

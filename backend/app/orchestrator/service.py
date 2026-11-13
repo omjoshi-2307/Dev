@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import urllib.parse
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -17,6 +19,7 @@ from backend.app.providers.openai_provider import OpenAIProvider
 from backend.app.router.enums import PrivacyLevel, ProviderName
 from backend.app.router.policy import RoutingPolicyError, route_request
 from backend.app.router.schemas import (
+    RESERVED_METADATA_KEYS,
     ChatMessageInput,
     ChatRequest,
     ChatResponse,
@@ -25,6 +28,78 @@ from backend.app.router.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def validate_local_destination(url: str | None) -> None:
+    """Validate that a destination endpoint is a verified local loopback address.
+
+    Enforces that LOCAL_ONLY requests can only execute against a verified local
+    endpoint. Rejects remote hostnames, external IPs, ambiguous formats, and URLs
+    with userinfo, failing closed before transmitting any message content.
+
+    Accepts:
+    - Schemes: http or https
+    - Hostnames: exact 'localhost' or 'localhost.'
+    - IP literals: IPv4 loopback (127.0.0.0/8) or IPv6 loopback (::1)
+
+    Rejects:
+    - Missing or non-string URLs
+    - Non-http/https schemes
+    - Remote hostnames and domain names (even if containing 'localhost' as a substring)
+    - Non-loopback IPs (e.g. LAN, private, public)
+    - URLs containing userinfo (user:pass@)
+    - Ambiguous, malformed, or unparseable URLs
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise RoutingPolicyError(
+            "LOCAL_ONLY destination boundary violation: local provider endpoint is not configured."
+        )
+
+    try:
+        parsed = urllib.parse.urlsplit(url.strip())
+    except Exception as exc:
+        raise RoutingPolicyError(
+            f"LOCAL_ONLY destination boundary violation: failed to parse endpoint URL: {exc}"
+        ) from exc
+
+    if parsed.scheme not in ("http", "https"):
+        raise RoutingPolicyError(
+            f"LOCAL_ONLY destination boundary violation: unsupported scheme '{parsed.scheme}'. "
+            "Only 'http' and 'https' are permitted."
+        )
+
+    if parsed.username or parsed.password:
+        raise RoutingPolicyError(
+            "LOCAL_ONLY destination boundary violation: userinfo in endpoint URL is not permitted."
+        )
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise RoutingPolicyError(
+            "LOCAL_ONLY destination boundary violation: endpoint URL missing valid hostname."
+        )
+
+    hostname = hostname.lower()
+
+    # Exact loopback hostnames (RFC 6761)
+    if hostname in ("localhost", "localhost."):
+        return
+
+    # Check for IP literal loopback (IPv4 127.0.0.0/8 and IPv6 ::1)
+    try:
+        ip = ipaddress.ip_address(hostname)
+        if ip.is_loopback:
+            return
+        raise RoutingPolicyError(
+            f"LOCAL_ONLY destination boundary violation: IP address '{hostname}' is not a local loopback address."
+        )
+    except ValueError:
+        pass
+
+    # Reject any non-loopback hostname
+    raise RoutingPolicyError(
+        f"LOCAL_ONLY destination boundary violation: host '{hostname}' is not a verified local loopback destination."
+    )
 
 
 def convert_messages(messages: Sequence[ChatMessageInput]) -> list[ChatMessage]:
@@ -72,6 +147,21 @@ class ChatOrchestrator:
         if openai_provider is not None:
             self._providers[ProviderName.OPENAI] = openai_provider
 
+    def _resolve_provider_endpoint(
+        self,
+        provider_name: ConcreteProvider | ProviderName,
+    ) -> str | None:
+        """Resolve the configured target endpoint URL for a provider."""
+        if provider_name == ProviderName.OLLAMA:
+            if ProviderName.OLLAMA in self._providers:
+                prov = self._providers[ProviderName.OLLAMA]
+                if hasattr(prov, "base_url") and isinstance(prov.base_url, str):
+                    return prov.base_url
+                if hasattr(prov, "_settings") and hasattr(prov._settings, "ollama_base_url"):
+                    return prov._settings.ollama_base_url
+            return getattr(self._settings, "ollama_base_url", None)
+        return None
+
     def _get_provider(self, provider_name: ConcreteProvider | ProviderName) -> AIProvider:
         """Resolve or lazily instantiate the requested provider adapter."""
         if provider_name in self._providers:
@@ -95,21 +185,24 @@ class ChatOrchestrator:
         Privacy and execution guarantees:
         1. Routing is purely deterministic via route_request().
         2. LOCAL_ONLY requests never execute cloud providers (OpenAI).
-        3. Only the selected provider is invoked; failures never trigger runtime fallback.
-        4. Response provider and model strictly reflect the authoritative routing decision.
+        3. LOCAL_ONLY requests only execute against verified local loopback endpoints.
+        4. Only the selected provider is invoked; failures never trigger runtime fallback.
+        5. Response provider and model strictly reflect the authoritative routing decision.
         """
         # 1. Authoritative deterministic routing
         decision: RoutingDecision = route_request(request, settings=self._settings)
 
         # 2. Defense-in-depth privacy boundary enforcement
-        if (
-            request.privacy_level == PrivacyLevel.LOCAL_ONLY
-            and decision.selected_provider != ProviderName.OLLAMA
-        ):
-            raise RoutingPolicyError(
-                f"Privacy boundary violation: request with privacy_level='local_only' "
-                f"cannot execute provider '{decision.selected_provider}'."
-            )
+        if request.privacy_level == PrivacyLevel.LOCAL_ONLY:
+            if decision.selected_provider != ProviderName.OLLAMA:
+                raise RoutingPolicyError(
+                    f"Privacy boundary violation: request with privacy_level='local_only' "
+                    f"cannot execute provider '{decision.selected_provider}'."
+                )
+
+            # Enforce that LOCAL_ONLY destination is strictly a verified local loopback endpoint
+            endpoint = self._resolve_provider_endpoint(decision.selected_provider)
+            validate_local_destination(endpoint)
 
         # 3. Message conversion
         provider_messages = convert_messages(request.messages)
@@ -130,7 +223,12 @@ class ChatOrchestrator:
             )
 
         # 6. Response normalization & audit preservation
-        response_metadata: dict[str, Any] = dict(request.metadata)
+        # Filter any reserved system/diagnostic keys from client metadata as defense-in-depth
+        response_metadata: dict[str, Any] = {
+            k: v
+            for k, v in request.metadata.items()
+            if str(k).lower() not in RESERVED_METADATA_KEYS
+        }
 
         # Detect provider identity mismatches safely without trusting provider self-reporting
         if provider_response.provider != decision.selected_provider:

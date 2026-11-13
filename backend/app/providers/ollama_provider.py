@@ -25,6 +25,11 @@ class OllamaProvider:
         self._settings = settings or get_settings()
         self._http_client = http_client
 
+    @property
+    def base_url(self) -> str:
+        """Return the configured base URL for the Ollama server."""
+        return self._settings.ollama_base_url
+
     async def generate(
         self,
         messages: Sequence[ChatMessage],
