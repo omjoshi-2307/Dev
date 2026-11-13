@@ -4,7 +4,6 @@ import asyncio
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-import re
 from typing import Any
 
 import httpx
@@ -35,26 +34,6 @@ def validate_openai_endpoint(endpoint: str) -> None:
         raise ProviderConfigurationError(
             "OpenAI endpoint must exactly match the trusted canonical endpoint."
         )
-
-
-def sanitize_error_text(text: str, secret_to_redact: str | None = None) -> str:
-    """Scrub common credentials from locally generated diagnostic text."""
-    if not text:
-        return ""
-
-    sanitized = text
-    if secret_to_redact:
-        sanitized = sanitized.replace(secret_to_redact, "[REDACTED]")
-    sanitized = re.sub(
-        r"Bearer\s+[^\s,;]+",
-        "Bearer [REDACTED]",
-        sanitized,
-        flags=re.IGNORECASE,
-    )
-    sanitized = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "[REDACTED]", sanitized)
-    sanitized = re.sub(r"\bkey-[A-Za-z0-9_-]{8,}\b", "[REDACTED]", sanitized)
-    sanitized = " ".join(sanitized.split())
-    return sanitized[:197] + "..." if len(sanitized) > 200 else sanitized
 
 
 def _error_code(response: httpx.Response) -> str | None:
