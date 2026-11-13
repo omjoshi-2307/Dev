@@ -111,18 +111,20 @@ The adapter uses `httpx` directly rather than invoking the official `openai` Pyt
 
 #### Protocol, Endpoint Security & Schema Mapping
 
-- **Fixed Endpoint & Host Policy:** The adapter uses the fixed HTTPS endpoint `https://api.openai.com/v1/responses`. To prevent credential exfiltration or accidental transmission across cleartext networks, `OpenAIProvider` strictly enforces HTTPS and validates that target hosts reside in an approved trusted-host list (`api.openai.com`). Insecure schemes (`http://`) or untrusted external hosts are rejected with a `ProviderConfigurationError` before any network request is issued or authorization headers are generated.
+- **Fixed Endpoint & Host Policy:** The adapter has no configurable endpoint parameter and sends credentials only to the exact canonical URL `https://api.openai.com/v1/responses`. The standalone validator rejects any non-identical URL, including alternate schemes, hosts, ports, paths, query strings, or embedded user information. Validation occurs before authorization headers are created or a network request is issued.
 - **Role Translation:** The Responses API specifies the `developer` role rather than the legacy `system` role. `OpenAIProvider` automatically translates incoming `ChatMessage(role="system", ...)` to `{"role": "developer", ...}` in the payload.
 - **Output Parsing:** The Responses API returns an `output` array of message objects containing content elements of type `output_text`. `OpenAIProvider.extract_output_text` reconstructs the concatenated text from all text parts while also supporting direct top-level `output_text` payloads for test and mock compatibility.
 
 #### Error Handling, Sanitization, and Credential Protection
 
-- **Credential Safety & Redaction:** Server-side `OPENAI_API_KEY` is loaded securely via Pydantic `Settings`. Sensitive credentials are scrubbed by `sanitize_error_text`, which redacts explicit API keys, bearer tokens, and `sk-...` / `key-...` patterns from error details. Raw upstream response bodies are never reflected directly into exception strings.
+- **Credential Safety & Error Sanitization:** Server-side `OPENAI_API_KEY` is loaded via Pydantic `Settings`. HTTP exception messages never include provider-controlled error messages or raw response bodies. The adapter uses fixed descriptions and HTTP status codes only; the local `sanitize_error_text` helper is not used to trust or expose upstream diagnostics.
 - **Authentication Failures (HTTP 401):** Mapped to `ProviderConfigurationError` with a fixed sanitized message (`OpenAI authentication failed: Invalid or unauthorized API key.`) to prevent leaking partial API keys or token fragments.
-- **Rate Limits & Quotas (HTTP 429):** Mapped to `RuntimeError` detailing quota or rate-limit exhaustion, with all credentials scrubbed and length bounded.
-- **Server Errors (HTTP 5xx):** Mapped to `RuntimeError` preserving the HTTP status code (e.g., `OpenAI service error (500): Upstream server error.`) while completely concealing upstream response bodies, stack traces, and internal server diagnostics.
-- **Timeouts & Network Faults:** Mapped to standard Python `TimeoutError` (`httpx.TimeoutException`) and `ConnectionError` (`httpx.RequestError`), sanitizing network exception classes without leaking connection strings.
+- **Rate Limits & Quotas (HTTP 429):** Transient rate limits are retried up to two times, honoring a valid bounded `Retry-After` value or using exponential backoff. Permanent quota/billing failures (for example, `insufficient_quota`) are not retried. Final errors use fixed descriptions and never include upstream message text.
+- **Server Errors (HTTP 5xx):** Retried up to two times with bounded exponential backoff, then mapped to `RuntimeError` preserving the HTTP status code (e.g., `OpenAI service error (500): Upstream server error.`) while concealing response bodies, stack traces, and internal diagnostics.
+- **Timeouts & Network Faults:** Transient timeout and request failures receive at most two retries. Exhausted timeouts map to Python `TimeoutError`; exhausted request failures map to `ConnectionError`. Exception strings do not expose raw transport details.
 - **Malformed Outputs:** Non-JSON responses or empty/whitespace-only output payloads raise `ValueError`.
+- **Constructor Compatibility:** The original second positional `client` argument remains reserved for legacy SDK-style clients. The HTTPX client is supplied by the keyword-only `http_client` parameter.
+- **Retry Bounds:** The default is two retries (three total attempts) for connection/timeout failures, transient HTTP 429 responses, and HTTP 5xx responses. Permanent quota failures are not retried; all retry delays are bounded.
 
 ### Ollama Local Adapter (`OllamaProvider`)
 
