@@ -643,7 +643,12 @@ def test_openai_provider_retries_transient_429_and_honors_retry_after() -> None:
             )
             assert result.content == "Recovered after rate limit"
 
-    asyncio.run(run())
+    with patch(
+        "backend.app.providers.openai_provider.asyncio.sleep",
+        new_callable=AsyncMock,
+    ) as sleep_mock:
+        asyncio.run(run())
+        sleep_mock.assert_awaited_once_with(0.0)
     assert attempts == 2
 
 
