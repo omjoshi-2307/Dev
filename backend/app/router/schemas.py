@@ -25,6 +25,10 @@ RESERVED_METADATA_KEYS = frozenset(
         "routing",
         "allow_fallback",
         "is_fallback",
+        "identity_mismatch",
+        "model_mismatch",
+        "provider_reported_name",
+        "provider_reported_model",
     }
 )
 
