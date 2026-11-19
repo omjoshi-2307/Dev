@@ -1722,7 +1722,55 @@ async def test_orchestrator_cloud_allowed_remote_ollama_preserves_custom_client_
     assert response.content == "remote reply"
     assert response.provider == ProviderName.OLLAMA
 
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("provider_name", "privacy_level"),
+    [
+        (ProviderName.OLLAMA, PrivacyLevel.LOCAL_ONLY),
+        (ProviderName.OPENAI, PrivacyLevel.CLOUD_ALLOWED),
+    ],
+)
+async def test_orchestrator_rejects_injected_builtin_provider_with_model_mismatch(
+    both_configured_settings: Settings,
+    provider_name: ProviderName,
+    privacy_level: PrivacyLevel,
+) -> None:
+    """Reject adapters whose own model setting differs from the router's decision."""
+    from backend.app.providers.openai_provider import OpenAIProvider
 
+    provider_settings = Settings(
+        OPENAI_API_KEY="test-openai-key",
+        OPENAI_MODEL="gpt-4.1-mini",
+        OLLAMA_MODEL="mistral:latest",
+        OLLAMA_BASE_URL=both_configured_settings.ollama_base_url,
+    )
 
+    if provider_name == ProviderName.OLLAMA:
+        provider, recorded = make_mock_ollama_provider(provider_settings)
+        orchestrator = ChatOrchestrator(
+            settings=both_configured_settings,
+            ollama_provider=provider,
+        )
+    else:
+        provider = OpenAIProvider(settings=provider_settings)
+        orchestrator = ChatOrchestrator(
+            settings=both_configured_settings,
+            openai_provider=provider,
+        )
 
+    request = ChatRequest(
+        messages=[ChatMessageInput(role="user", content="Check routed model integrity")],
+        privacy_level=privacy_level,
+        preferred_provider=provider_name,
+    )
+
+    try:
+        with pytest.raises(RoutingPolicyError, match="Provider model configuration mismatch"):
+            await orchestrator.handle_chat_request(request)
+
+        if provider_name == ProviderName.OLLAMA:
+            assert recorded == []
+    finally:
+        if provider_name == ProviderName.OLLAMA:
+            await provider._http_client.aclose()
 

@@ -147,6 +147,36 @@ def validate_provider_identity(
             )
 
 
+def validate_provider_model(
+    provider_name: ConcreteProvider | ProviderName,
+    provider: Any,
+    expected_model: str,
+) -> None:
+    """Ensure a built-in provider adapter executes the model selected by the router.
+
+    Injected adapters may carry settings that differ from the orchestrator's settings.
+    Reject that mismatch before sending a request so the response cannot claim a model
+    different from the one the adapter actually executes.
+    """
+    configured_model: str | None = None
+
+    if provider_name == ProviderName.OLLAMA and type(provider) is OllamaProvider:
+        provider_settings = getattr(provider, "_settings", None)
+        configured_model = getattr(provider_settings, "ollama_model", None)
+    elif provider_name == ProviderName.OPENAI and type(provider) is OpenAIProvider:
+        provider_settings = getattr(provider, "_settings", None)
+        configured_model = getattr(provider_settings, "openai_model", None)
+    else:
+        # Test doubles and third-party adapters expose no standard settings contract.
+        return
+
+    if configured_model != expected_model:
+        raise RoutingPolicyError(
+            f"Provider model configuration mismatch: router selected '{expected_model}' "
+            f"for '{provider_name.value}', but the adapter is configured for '{configured_model}'."
+        )
+
+
 def validate_trusted_local_ollama_provider(provider: Any) -> None:
     """Validate that provider is the exact, unmodified, trusted OllamaProvider implementation.
 
@@ -284,6 +314,7 @@ class ChatOrchestrator:
         # 2. Defense-in-depth privacy boundary and provider identity enforcement
         provider = self._get_provider(decision.selected_provider)
         validate_provider_identity(decision.selected_provider, provider)
+        validate_provider_model(decision.selected_provider, provider, decision.model)
 
         if request.privacy_level == PrivacyLevel.LOCAL_ONLY:
             if decision.selected_provider != ProviderName.OLLAMA:
