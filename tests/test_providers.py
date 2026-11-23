@@ -1191,6 +1191,42 @@ def test_validate_injected_client_custom_unverifiable_transport_rejected() -> No
         validate_injected_client_for_local_endpoint(client)
 
 
+
+def test_validate_injected_client_async_http_transport_subclass_rejected() -> None:
+    class ForwardingTransport(httpx.AsyncHTTPTransport):
+        async def handle_async_request(
+            self, request: httpx.Request
+        ) -> httpx.Response:
+            raise AssertionError("custom transport must never be executed")
+
+    client = httpx.AsyncClient(
+        transport=ForwardingTransport(),
+        trust_env=False,
+    )
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="custom or unverifiable transport",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
+
+def test_validate_injected_client_mock_transport_subclass_rejected() -> None:
+    class CustomMockTransport(httpx.MockTransport):
+        async def handle_async_request(
+            self, request: httpx.Request
+        ) -> httpx.Response:
+            raise AssertionError("custom transport must never be executed")
+
+    client = httpx.AsyncClient(
+        transport=CustomMockTransport(lambda _request: httpx.Response(200)),
+        trust_env=False,
+    )
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="custom or unverifiable transport",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
 def test_validate_injected_client_non_httpx_client_rejected() -> None:
     class DummyClient:
         pass

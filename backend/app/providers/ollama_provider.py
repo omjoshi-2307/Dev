@@ -132,11 +132,11 @@ def validate_injected_client_for_local_endpoint(client: Any) -> None:
         )
 
     # In-memory test transports with verified direct execution
-    if isinstance(transport, (httpx.MockTransport, httpx.ASGITransport)):
+    if type(transport) in (httpx.MockTransport, httpx.ASGITransport):
         return
 
     # Direct async HTTP transport check
-    if isinstance(transport, httpx.AsyncHTTPTransport):
+    if type(transport) is httpx.AsyncHTTPTransport:
         pool = getattr(transport, "_pool", None)
         if pool is None:
             raise ProviderConfigurationError(
@@ -150,24 +150,26 @@ def validate_injected_client_for_local_endpoint(client: Any) -> None:
                 "configured, violating local destination boundaries."
             )
 
-        # Check against httpcore pool types if available
+        # httpx transports can wrap custom httpcore pools. Require the exact
+        # stock connection-pool class so subclasses cannot override request routing.
+        if "proxy" in pool_cls_name.lower() or hasattr(pool, "_proxy_url"):
+            raise ProviderConfigurationError(
+                "Injected HTTP client for local Ollama provider has an explicit proxy transport "
+                "configured, violating local destination boundaries."
+            )
+
         try:
             import httpcore
-            if isinstance(pool, (httpcore.AsyncHTTPProxy, httpcore.AsyncSOCKSProxy)):
-                raise ProviderConfigurationError(
-                    "Injected HTTP client for local Ollama provider has an explicit proxy transport "
-                    "configured, violating local destination boundaries."
-                )
-            if isinstance(pool, httpcore.AsyncConnectionPool):
-                return
-        except ImportError:
-            pass
+        except ImportError as exc:
+            raise ProviderConfigurationError(
+                "Cannot verify the injected HTTP client pool without httpcore."
+            ) from exc
 
-        if pool_cls_name == "AsyncConnectionPool" and not hasattr(pool, "_proxy_url"):
+        if type(pool) is httpcore.AsyncConnectionPool:
             return
 
         raise ProviderConfigurationError(
-            f"Injected HTTP client transport pool '{pool_cls_name}' cannot be verified as direct."
+            f"Injected HTTP client transport pool '{pool_cls_name}' is custom or cannot be verified as the exact direct connection pool."
         )
 
     # Any custom or unknown transport class cannot be established as direct
