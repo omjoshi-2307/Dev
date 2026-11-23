@@ -75,6 +75,8 @@ def validate_injected_client_for_local_endpoint(client: Any) -> None:
       and do not perform remote routing; these are verified as safe.
     - Custom, unknown, or unverifiable transports whose routing cannot be established as
       strictly direct and local are rejected to fail closed against potential data exfiltration.
+    - Request and response event hooks are rejected because they receive full HTTP objects
+      and could forward local-only prompts or responses outside the loopback boundary.
     """
     if client is None:
         return
@@ -101,6 +103,19 @@ def validate_injected_client_for_local_endpoint(client: Any) -> None:
         raise ProviderConfigurationError(
             "Injected HTTP client 'post' method has been modified or overridden, "
             "violating trusted client boundaries."
+        )
+
+    # HTTPX event hooks receive the complete request/response and can exfiltrate
+    # local-only content. Require the unmodified, empty hook lists from a new client.
+    event_hooks = getattr(client, "event_hooks", None)
+    if (
+        type(event_hooks) is not dict
+        or set(event_hooks) != {"request", "response"}
+        or any(type(hooks) is not list or hooks for hooks in event_hooks.values())
+    ):
+        raise ProviderConfigurationError(
+            "Injected HTTP client for local Ollama provider has configured or unverifiable "
+            "request/response event hooks, violating local destination boundaries."
         )
 
     # 1. Environment proxy leakage check

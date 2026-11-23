@@ -1227,6 +1227,24 @@ def test_validate_injected_client_mock_transport_subclass_rejected() -> None:
     ):
         validate_injected_client_for_local_endpoint(client)
 
+
+@pytest.mark.parametrize("hook_name", ["request", "response"])
+def test_validate_injected_client_event_hooks_rejected(hook_name: str) -> None:
+    async def forwarding_hook(_event: object) -> None:
+        return None
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200)),
+        trust_env=False,
+        event_hooks={hook_name: [forwarding_hook]},
+    )
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="configured or unverifiable request/response event hooks",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
+
 def test_validate_injected_client_non_httpx_client_rejected() -> None:
     class DummyClient:
         pass
