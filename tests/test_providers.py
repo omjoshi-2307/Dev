@@ -10,7 +10,10 @@ import pytest
 
 from backend.app.config import Settings
 from backend.app.providers.base import ChatMessage, ProviderConfigurationError
-from backend.app.providers.ollama_provider import OllamaProvider
+from backend.app.providers.ollama_provider import (
+    OllamaProvider,
+    validate_injected_client_for_local_endpoint,
+)
 from backend.app.providers.openai_provider import (
     DEFAULT_OPENAI_ENDPOINT,
     OpenAIProvider,
@@ -899,4 +902,495 @@ def test_extract_output_text_preserves_model_refusal_text() -> None:
         ]
     }
     assert extract_output_text(payload) == "I cannot help with that request."
+
+
+# ---------------------------------------------------------------------------
+# OllamaProvider Proxy Hardening Tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_ollama_provider_loopback_disables_trust_env_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.evil.corp:8080")
+    monkeypatch.setenv("ALL_PROXY", "http://proxy.evil.corp:8080")
+
+    recorded_kwargs: dict[str, object] = {}
+
+    class InterceptClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            recorded_kwargs.update(kwargs)
+
+        async def __aenter__(self) -> "InterceptClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            pass
+
+        async def post(
+            self, url: str, json: dict[str, object], **kwargs: object
+        ) -> httpx.Response:
+            recorded_kwargs.update(kwargs)
+            return httpx.Response(
+                200,
+                json={"message": {"role": "assistant", "content": "direct reply"}},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", InterceptClient)
+
+    provider = OllamaProvider(
+        settings=Settings(
+            OLLAMA_BASE_URL="http://127.0.0.1:11434",
+            OLLAMA_MODEL="small-model",
+        )
+    )
+
+    resp = await provider.generate([ChatMessage(role="user", content="hello")])
+    assert resp.content == "direct reply"
+    assert recorded_kwargs.get("trust_env") is False
+
+
+@pytest.mark.anyio
+async def test_ollama_provider_remote_enables_trust_env_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded_kwargs: dict[str, object] = {}
+
+    class InterceptClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            recorded_kwargs.update(kwargs)
+
+        async def __aenter__(self) -> "InterceptClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            pass
+
+        async def post(
+            self, url: str, json: dict[str, object], **kwargs: object
+        ) -> httpx.Response:
+            recorded_kwargs.update(kwargs)
+            return httpx.Response(
+                200,
+                json={"message": {"role": "assistant", "content": "remote reply"}},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", InterceptClient)
+
+    provider = OllamaProvider(
+        settings=Settings(
+            OLLAMA_BASE_URL="http://remote-team-ollama.internal:11434",
+            OLLAMA_MODEL="small-model",
+        )
+    )
+
+    resp = await provider.generate([ChatMessage(role="user", content="hello")])
+    assert resp.content == "remote reply"
+    assert recorded_kwargs.get("trust_env") is True
+
+
+@pytest.mark.anyio
+async def test_injected_client_with_proxy_mount_rejected_for_local_loopback() -> None:
+    client = httpx.AsyncClient(proxy="http://proxy.evil.corp:8080", trust_env=False)
+    provider = OllamaProvider(
+        settings=Settings(
+            OLLAMA_BASE_URL="http://127.0.0.1:11434",
+            OLLAMA_MODEL="small-model",
+        ),
+        http_client=client,
+    )
+
+    with pytest.raises(ProviderConfigurationError, match="proxy"):
+        await provider.generate([ChatMessage(role="user", content="hello")])
+
+
+@pytest.mark.anyio
+async def test_injected_client_with_trust_env_and_active_proxy_rejected_for_local(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.evil.corp:8080")
+    client = httpx.AsyncClient(trust_env=True)
+
+    provider = OllamaProvider(
+        settings=Settings(
+            OLLAMA_BASE_URL="http://127.0.0.1:11434",
+            OLLAMA_MODEL="small-model",
+        ),
+        http_client=client,
+    )
+
+    with pytest.raises(ProviderConfigurationError, match="proxy"):
+        await provider.generate([ChatMessage(role="user", content="hello")])
+
+
+@pytest.mark.anyio
+async def test_injected_client_with_trust_env_false_accepted_for_local(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.evil.corp:8080")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"message": {"role": "assistant", "content": "safe loopback reply"}},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        trust_env=False,
+    ) as client:
+        provider = OllamaProvider(
+            settings=Settings(
+                OLLAMA_BASE_URL="http://127.0.0.1:11434",
+                OLLAMA_MODEL="small-model",
+            ),
+            http_client=client,
+        )
+
+        resp = await provider.generate([ChatMessage(role="user", content="hello")])
+        assert resp.content == "safe loopback reply"
+
+
+@pytest.mark.anyio
+async def test_injected_client_with_proxy_allowed_for_remote_destination() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"message": {"role": "assistant", "content": "remote proxy reply"}},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        trust_env=True,
+    ) as client:
+        provider = OllamaProvider(
+            settings=Settings(
+                OLLAMA_BASE_URL="http://remote.host:11434",
+                OLLAMA_MODEL="small-model",
+            ),
+            http_client=client,
+        )
+
+        resp = await provider.generate([ChatMessage(role="user", content="hello")])
+        assert resp.content == "remote proxy reply"
+
+
+@pytest.mark.anyio
+async def test_ollama_provider_explicit_trust_env_true_on_loopback_still_disables_proxies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.evil.corp:8080")
+    monkeypatch.setenv("ALL_PROXY", "http://proxy.evil.corp:8080")
+
+    recorded_kwargs: dict[str, object] = {}
+
+    class InterceptClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            recorded_kwargs.update(kwargs)
+
+        async def __aenter__(self) -> "InterceptClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            pass
+
+        async def post(
+            self, url: str, json: dict[str, object], **kwargs: object
+        ) -> httpx.Response:
+            recorded_kwargs.update(kwargs)
+            return httpx.Response(
+                200,
+                json={"message": {"role": "assistant", "content": "direct reply"}},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", InterceptClient)
+
+    # Even with trust_env=True explicitly configured, loopback MUST force trust_env=False
+    provider = OllamaProvider(
+        settings=Settings(
+            OLLAMA_BASE_URL="http://127.0.0.1:11434",
+            OLLAMA_MODEL="small-model",
+        ),
+        trust_env=True,
+    )
+
+    resp = await provider.generate([ChatMessage(role="user", content="hello")])
+    assert resp.content == "direct reply"
+    assert recorded_kwargs.get("trust_env") is False
+
+
+# ---------------------------------------------------------------------------
+# Injected Transport and Client Hardening Tests for Local Loopback Endpoints
+# ---------------------------------------------------------------------------
+def test_validate_injected_client_explicit_proxy_transport_rejected() -> None:
+    # Explicit proxy transport must be rejected even with trust_env=False
+    proxy_transport = httpx.AsyncHTTPTransport(
+        proxy="http://proxy.corporate.internal:8080"
+    )
+    client = httpx.AsyncClient(transport=proxy_transport, trust_env=False)
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="explicit proxy transport configured",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
+
+def test_validate_injected_client_proxy_mounts_rejected() -> None:
+    client = httpx.AsyncClient(proxy="http://proxy.corporate.internal:8080")
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="proxy mounts configured",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
+
+def test_validate_injected_client_trust_env_true_with_env_vars_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.corporate.internal:8080")
+    client = httpx.AsyncClient(trust_env=True)
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="trust_env=True while proxy environment variables are active",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
+
+def test_validate_injected_client_safe_direct_transports_accepted() -> None:
+    # 1. Standard direct async client
+    direct_client = httpx.AsyncClient(trust_env=False)
+    validate_injected_client_for_local_endpoint(direct_client)
+
+    # 2. In-memory MockTransport
+    mock_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200)),
+        trust_env=False,
+    )
+    validate_injected_client_for_local_endpoint(mock_client)
+
+    # 3. None client passes (defaults handled internally)
+    validate_injected_client_for_local_endpoint(None)
+
+
+def test_validate_injected_client_custom_unverifiable_transport_rejected() -> None:
+    class CustomTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(
+            self, request: httpx.Request
+        ) -> httpx.Response:
+            return httpx.Response(200)
+
+    client = httpx.AsyncClient(transport=CustomTransport(), trust_env=False)
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="custom or unverifiable transport",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
+
+
+def test_validate_injected_client_async_http_transport_subclass_rejected() -> None:
+    class ForwardingTransport(httpx.AsyncHTTPTransport):
+        async def handle_async_request(
+            self, request: httpx.Request
+        ) -> httpx.Response:
+            raise AssertionError("custom transport must never be executed")
+
+    client = httpx.AsyncClient(
+        transport=ForwardingTransport(),
+        trust_env=False,
+    )
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="custom or unverifiable transport",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
+
+def test_validate_injected_client_mock_transport_subclass_rejected() -> None:
+    class CustomMockTransport(httpx.MockTransport):
+        async def handle_async_request(
+            self, request: httpx.Request
+        ) -> httpx.Response:
+            raise AssertionError("custom transport must never be executed")
+
+    client = httpx.AsyncClient(
+        transport=CustomMockTransport(lambda _request: httpx.Response(200)),
+        trust_env=False,
+    )
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="custom or unverifiable transport",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
+
+@pytest.mark.parametrize("hook_name", ["request", "response"])
+def test_validate_injected_client_event_hooks_rejected(hook_name: str) -> None:
+    async def forwarding_hook(_event: object) -> None:
+        return None
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200)),
+        trust_env=False,
+        event_hooks={hook_name: [forwarding_hook]},
+    )
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="configured or unverifiable request/response event hooks",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
+
+def test_validate_injected_client_non_httpx_client_rejected() -> None:
+    class DummyClient:
+        pass
+
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="not a valid or verifiable HTTPX client",
+    ):
+        validate_injected_client_for_local_endpoint(DummyClient())
+
+
+def test_validate_injected_client_follow_redirects_true_rejected() -> None:
+    client = httpx.AsyncClient(follow_redirects=True)
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="follow_redirects=True",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
+
+@pytest.mark.anyio
+async def test_ollama_provider_injected_client_with_follow_redirects_rejected() -> None:
+    client = httpx.AsyncClient(follow_redirects=True)
+    provider = OllamaProvider(
+        settings=Settings(
+            OLLAMA_BASE_URL="http://127.0.0.1:11434",
+            OLLAMA_MODEL="small-model",
+        ),
+        http_client=client,
+    )
+
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="follow_redirects=True",
+    ):
+        await provider.generate([ChatMessage(role="user", content="hello")])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("redirect_code", [301, 302, 303, 307, 308])
+async def test_ollama_provider_simulated_redirect_fails_closed_without_forwarding(
+    redirect_code: int,
+) -> None:
+    recorded_requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        recorded_requests.append(str(request.url))
+        return httpx.Response(
+            redirect_code,
+            headers={"Location": "http://evil.remote.corp:8080/api/chat"},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        trust_env=False,
+        follow_redirects=False,
+    )
+    provider = OllamaProvider(
+        settings=Settings(
+            OLLAMA_BASE_URL="http://127.0.0.1:11434",
+            OLLAMA_MODEL="small-model",
+        ),
+        http_client=client,
+    )
+
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="refusing to follow redirects for local destination",
+    ):
+        await provider.generate([ChatMessage(role="user", content="secret payload")])
+
+    # Exactly one request made to local loopback; redirect target was NEVER reached
+    assert len(recorded_requests) == 1
+    assert recorded_requests[0] == "http://127.0.0.1:11434/api/chat"
+    assert "evil.remote.corp" not in recorded_requests[0]
+
+
+def test_validate_injected_client_custom_client_with_fake_transport_rejected() -> None:
+    class FakeDirectClient:
+        def __init__(self) -> None:
+            self._transport = httpx.MockTransport(lambda req: httpx.Response(200))
+            self.trust_env = False
+            self.follow_redirects = False
+            self._mounts: dict[str, object] = {}
+
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="must be an exact httpx.AsyncClient instance",
+    ):
+        validate_injected_client_for_local_endpoint(FakeDirectClient())
+
+
+def test_validate_injected_client_async_client_subclass_rejected() -> None:
+    class SubclassedAsyncClient(httpx.AsyncClient):
+        async def post(self, *args: object, **kwargs: object) -> httpx.Response:
+            return httpx.Response(200)
+
+    client = SubclassedAsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200)),
+        trust_env=False,
+    )
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="must be an exact httpx.AsyncClient instance",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
+
+def test_validate_injected_client_instance_level_post_override_rejected() -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200)),
+        trust_env=False,
+    )
+    client.__dict__["post"] = lambda *args, **kwargs: None
+
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="overridden 'post' method",
+    ):
+        validate_injected_client_for_local_endpoint(client)
+
+
+@pytest.mark.anyio
+async def test_ollama_provider_rejects_subclassed_async_client() -> None:
+    class SubclassedAsyncClient(httpx.AsyncClient):
+        pass
+
+    client = SubclassedAsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200)),
+        trust_env=False,
+    )
+    provider = OllamaProvider(
+        settings=Settings(
+            OLLAMA_BASE_URL="http://127.0.0.1:11434",
+            OLLAMA_MODEL="small-model",
+        ),
+        http_client=client,
+    )
+
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="must be an exact httpx.AsyncClient instance",
+    ):
+        await provider.generate([ChatMessage(role="user", content="hello")])
+
+
+
 
