@@ -17,6 +17,7 @@ from backend.app.providers.ollama_provider import (
 from backend.app.providers.openai_provider import (
     DEFAULT_OPENAI_ENDPOINT,
     OpenAIProvider,
+    _retry_delay,
     extract_output_text,
     validate_openai_endpoint,
 )
@@ -613,6 +614,13 @@ def test_openai_provider_does_not_allow_endpoint_override() -> None:
             endpoint="https://api.openai.com:8443/v1/responses",
         )
 
+
+
+@pytest.mark.parametrize("retry_after", ["NaN", "Infinity", "-Infinity"])
+def test_retry_delay_uses_backoff_for_non_finite_retry_after(retry_after: str) -> None:
+    response = httpx.Response(429, headers={"Retry-After": retry_after})
+
+    assert _retry_delay(response, attempt=1, backoff=0.5) == 1.0
 
 
 def test_openai_provider_retries_transient_429_and_honors_retry_after() -> None:
