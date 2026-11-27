@@ -1440,3 +1440,23 @@ async def test_ollama_provider_rejects_subclassed_async_client() -> None:
 
 
 
+
+
+
+def test_retry_delay_clamps_far_future_http_date() -> None:
+    response = httpx.Response(
+        429,
+        headers={"Retry-After": "Thu, 01 Jan 2099 00:00:00 GMT"},
+    )
+
+    assert _retry_delay(response, attempt=0, backoff=0.5) == 30.0
+
+
+
+def test_retry_delay_returns_zero_for_past_http_date() -> None:
+    response = httpx.Response(
+        429,
+        headers={"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"},
+    )
+
+    assert _retry_delay(response, attempt=0, backoff=0.5) == 0.0
