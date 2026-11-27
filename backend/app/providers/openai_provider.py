@@ -75,7 +75,10 @@ def _retry_delay(response: httpx.Response, attempt: int, backoff: float) -> floa
     retry_after = response.headers.get("Retry-After")
     if retry_after:
         try:
-            return min(max(float(retry_after), 0.0), MAX_RETRY_AFTER_SECONDS)
+            seconds = float(retry_after)
+            if not math.isfinite(seconds):
+                raise ValueError("Retry-After must be finite.")
+            return min(max(seconds, 0.0), MAX_RETRY_AFTER_SECONDS)
         except ValueError:
             try:
                 retry_at = parsedate_to_datetime(retry_after)

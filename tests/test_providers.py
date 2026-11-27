@@ -17,6 +17,7 @@ from backend.app.providers.ollama_provider import (
 from backend.app.providers.openai_provider import (
     DEFAULT_OPENAI_ENDPOINT,
     OpenAIProvider,
+    _retry_delay,
     extract_output_text,
     validate_openai_endpoint,
 )
@@ -613,6 +614,51 @@ def test_openai_provider_does_not_allow_endpoint_override() -> None:
             endpoint="https://api.openai.com:8443/v1/responses",
         )
 
+
+
+@pytest.mark.parametrize("retry_after", ["NaN", "Infinity", "-Infinity"])
+def test_retry_delay_uses_backoff_for_non_finite_retry_after(retry_after: str) -> None:
+    response = httpx.Response(429, headers={"Retry-After": retry_after})
+
+    assert _retry_delay(response, attempt=1, backoff=0.5) == 1.0
+
+
+@pytest.mark.parametrize("retry_after", ["NaN", "Infinity", "-Infinity"])
+def test_openai_provider_retries_after_non_finite_retry_after(retry_after: str) -> None:
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": retry_after},
+                json={"error": {"code": "rate_limit_exceeded"}},
+            )
+        return httpx.Response(200, json={"output_text": "Recovered"})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            provider = OpenAIProvider(
+                settings=Settings(OPENAI_API_KEY="test-key", OPENAI_MODEL="test"),
+                http_client=client,
+                retry_backoff=0.5,
+            )
+            result = await provider.generate(
+                [ChatMessage(role="user", content="Hi")]
+            )
+            assert result.content == "Recovered"
+
+    with patch(
+        "backend.app.providers.openai_provider.asyncio.sleep",
+        new_callable=AsyncMock,
+    ) as sleep_mock:
+        asyncio.run(run())
+        sleep_mock.assert_awaited_once_with(0.5)
+    assert attempts == 2
 
 
 def test_openai_provider_retries_transient_429_and_honors_retry_after() -> None:
@@ -1394,3 +1440,23 @@ async def test_ollama_provider_rejects_subclassed_async_client() -> None:
 
 
 
+
+
+
+def test_retry_delay_clamps_far_future_http_date() -> None:
+    response = httpx.Response(
+        429,
+        headers={"Retry-After": "Thu, 01 Jan 2099 00:00:00 GMT"},
+    )
+
+    assert _retry_delay(response, attempt=0, backoff=0.5) == 30.0
+
+
+
+def test_retry_delay_returns_zero_for_past_http_date() -> None:
+    response = httpx.Response(
+        429,
+        headers={"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"},
+    )
+
+    assert _retry_delay(response, attempt=0, backoff=0.5) == 0.0
